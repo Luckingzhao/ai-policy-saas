@@ -7,13 +7,16 @@ import {
   Archive,
   Bot,
   ChevronDown,
+  CheckSquare,
   CheckCircle2,
   ClipboardCheck,
   Download,
   FileText,
   Loader2,
   PencilLine,
-  RefreshCw
+  RefreshCw,
+  Square,
+  Trash2
 } from "lucide-react";
 import { EmptyState } from "@/components/ui";
 import { createBrowserSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
@@ -33,6 +36,8 @@ export function ReportsClient() {
   const [message, setMessage] = useState("");
   const [parsingId, setParsingId] = useState<string | null>(null);
   const [statusUpdatingId, setStatusUpdatingId] = useState<string | null>(null);
+  const [deletingIds, setDeletingIds] = useState<string[]>([]);
+  const [selectedArchivedIds, setSelectedArchivedIds] = useState<string[]>([]);
   const [openExportId, setOpenExportId] = useState<string | null>(null);
   const [floatingTip, setFloatingTip] = useState<{ x: number; y: number; text: string } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -63,6 +68,9 @@ export function ReportsClient() {
       setMessage(reportsResult.error.message);
     } else {
       setReports(reportsResult.data ?? []);
+      setSelectedArchivedIds((current) =>
+        current.filter((id) => reportsResult.data?.some((report) => report.id === id && report.status === "archived"))
+      );
     }
 
     if (customersResult.error) {
@@ -140,6 +148,62 @@ export function ReportsClient() {
     await loadReports();
   }
 
+  function toggleArchivedSelected(reportId: string) {
+    setSelectedArchivedIds((current) =>
+      current.includes(reportId) ? current.filter((id) => id !== reportId) : [...current, reportId]
+    );
+  }
+
+  function toggleSelectAllArchived() {
+    const archivedIds = filteredReports.filter((report) => report.status === "archived").map((report) => report.id);
+    if (archivedIds.length > 0 && selectedArchivedIds.length === archivedIds.length) {
+      setSelectedArchivedIds([]);
+      return;
+    }
+
+    setSelectedArchivedIds(archivedIds);
+  }
+
+  async function deleteArchivedReports(reportIds: string[]) {
+    const ids = [...new Set(reportIds)].filter(Boolean);
+    if (ids.length === 0) return;
+
+    const confirmMessage =
+      ids.length === 1
+        ? "确认删除这份归档报告吗？删除后不可恢复。"
+        : `确认删除已选中的 ${ids.length} 份归档报告吗？删除后不可恢复。`;
+
+    if (!window.confirm(confirmMessage)) return;
+
+    setMessage("");
+    setDeletingIds(ids);
+
+    const { data: userData } = await supabase.auth.getUser();
+    if (!userData.user) {
+      setMessage("请先登录后再删除归档报告。");
+      setDeletingIds([]);
+      return;
+    }
+
+    const { error } = await supabase
+      .from("h5_reports")
+      .delete()
+      .eq("user_id", userData.user.id)
+      .eq("status", "archived")
+      .in("id", ids);
+
+    setDeletingIds([]);
+
+    if (error) {
+      setMessage(error.message);
+      return;
+    }
+
+    setSelectedArchivedIds((current) => current.filter((id) => !ids.includes(id)));
+    setMessage(ids.length === 1 ? "归档报告已删除。" : `已删除 ${ids.length} 份归档报告。`);
+    await loadReports();
+  }
+
   function showPendingExportTip(event: React.MouseEvent<HTMLButtonElement>) {
     setOpenExportId(null);
     setFloatingTip({
@@ -152,6 +216,9 @@ export function ReportsClient() {
   const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
   const activeReports = reports.filter((report) => report.status !== "archived");
   const filteredReports = status === "all" ? activeReports : reports.filter((report) => report.status === status);
+  const archivedIds = filteredReports.filter((report) => report.status === "archived").map((report) => report.id);
+  const allArchivedSelected = archivedIds.length > 0 && selectedArchivedIds.length === archivedIds.length;
+  const hasArchivedSelection = selectedArchivedIds.length > 0;
 
   return (
     <div>
@@ -171,6 +238,35 @@ export function ReportsClient() {
         </button>
       </div>
 
+      {status === "archived" ? (
+        <div className="mb-4 flex flex-col gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-sm font-semibold text-ink">归档报告清理</p>
+            <p className="mt-1 text-sm text-slate-500">归档报告可恢复到报告管理，也可以删除历史归档记录。</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={toggleSelectAllArchived}
+              disabled={archivedIds.length === 0}
+              className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-600 hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {allArchivedSelected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+              {allArchivedSelected ? "取消全选" : "全选"}
+            </button>
+            <button
+              type="button"
+              onClick={() => deleteArchivedReports(selectedArchivedIds)}
+              disabled={!hasArchivedSelection || deletingIds.length > 0}
+              className="inline-flex items-center justify-center gap-2 rounded-md bg-coral px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-coral-dark disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {deletingIds.length > 0 ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              删除已选
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {message ? <p className="mb-4 rounded-md bg-slate-50 px-4 py-3 text-sm text-slate-600">{message}</p> : null}
       {isLoading ? <p className="rounded-lg bg-white p-6 text-sm text-slate-500">正在加载报告...</p> : null}
 
@@ -182,9 +278,24 @@ export function ReportsClient() {
         {filteredReports.map((report) => {
           const customer = customerMap.get(report.customer_id ?? "");
           return (
-            <article key={report.id} className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+            <article
+              key={report.id}
+              className={`rounded-lg border bg-white p-5 shadow-sm transition ${
+                selectedArchivedIds.includes(report.id) ? "border-coral/60 ring-2 ring-coral/10" : "border-slate-200"
+              }`}
+            >
               <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex min-w-0 items-start gap-3">
+                  {report.status === "archived" ? (
+                    <button
+                      type="button"
+                      onClick={() => toggleArchivedSelected(report.id)}
+                      className="mt-2 text-slate-400 hover:text-coral"
+                      aria-label={selectedArchivedIds.includes(report.id) ? "取消选择报告" : "选择报告"}
+                    >
+                      {selectedArchivedIds.includes(report.id) ? <CheckSquare className="h-5 w-5" /> : <Square className="h-5 w-5" />}
+                    </button>
+                  ) : null}
                   <span className="flex h-10 w-10 items-center justify-center rounded-md bg-red-50 text-brand">
                     <FileText className="h-5 w-5" />
                   </span>
@@ -464,6 +575,10 @@ function formatDate(value: string) {
   return new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",
     month: "2-digit",
-    day: "2-digit"
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
   }).format(new Date(value));
 }

@@ -2,7 +2,18 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ClipboardPenLine, FileSpreadsheet, FileText, FileType2, FileUp, Loader2, UploadCloud } from "lucide-react";
+import {
+  CheckSquare,
+  ClipboardPenLine,
+  FileSpreadsheet,
+  FileText,
+  FileType2,
+  FileUp,
+  Loader2,
+  Square,
+  Trash2,
+  UploadCloud
+} from "lucide-react";
 import { createBrowserSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/database.types";
 import { getMonthRange, getPlanLabel, getPlanLimit, isUsageLimitDisabled } from "@/lib/usage";
@@ -69,6 +80,8 @@ export function UploadClient() {
   const [monthlyReportsUsed, setMonthlyReportsUsed] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
+  const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
+  const [isDeletingFiles, setIsDeletingFiles] = useState(false);
   const [uploadStep, setUploadStep] = useState("");
 
   async function loadData() {
@@ -121,6 +134,7 @@ export function UploadClient() {
       setMessage(filesResult.error.message);
     } else {
       setFiles(filesResult.data ?? []);
+      setSelectedFileIds((current) => current.filter((id) => filesResult.data?.some((file) => file.id === id)));
     }
 
     if (!subscriptionResult.error) {
@@ -289,10 +303,60 @@ export function UploadClient() {
     }
   }
 
+  function toggleFileSelected(fileId: string) {
+    setSelectedFileIds((current) => (current.includes(fileId) ? current.filter((id) => id !== fileId) : [...current, fileId]));
+  }
+
+  function toggleSelectAllFiles() {
+    if (files.length > 0 && selectedFileIds.length === files.length) {
+      setSelectedFileIds([]);
+      return;
+    }
+
+    setSelectedFileIds(files.map((file) => file.id));
+  }
+
+  async function deleteSelectedFiles() {
+    const ids = [...new Set(selectedFileIds)].filter(Boolean);
+    if (ids.length === 0) return;
+
+    if (!window.confirm(`确认删除已选中的 ${ids.length} 个上传文件吗？删除后，最近上传列表不再显示这些文件。`)) return;
+
+    setMessage("");
+    setIsDeletingFiles(true);
+
+    const { data: userData, error: userError } = await supabase.auth.getUser();
+    if (userError || !userData.user) {
+      setMessage("请先登录后再删除上传文件。");
+      setIsDeletingFiles(false);
+      return;
+    }
+
+    const selectedFiles = files.filter((file) => ids.includes(file.id));
+    const objectPaths = selectedFiles.map((file) => file.object_path).filter(Boolean);
+    if (objectPaths.length > 0) {
+      await supabase.storage.from("policy-pdfs").remove(objectPaths);
+    }
+
+    const { error } = await supabase.from("report_files").delete().eq("user_id", userData.user.id).in("id", ids);
+    setIsDeletingFiles(false);
+
+    if (error) {
+      setMessage(error.message);
+      return;
+    }
+
+    setSelectedFileIds([]);
+    setMessage(`已删除 ${ids.length} 个上传文件。`);
+    await loadData();
+  }
+
   const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
   const reportLimit = getPlanLimit(subscription?.plan_code, subscription?.monthly_report_limit);
   const usageLimitDisabled = isUsageLimitDisabled();
   const selectedFileTooLarge = selectedFile ? isFileTooLarge(selectedFile, uploadFormat) : false;
+  const allFilesSelected = files.length > 0 && selectedFileIds.length === files.length;
+  const hasSelectedFiles = selectedFileIds.length > 0;
 
   return (
     <div className="grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
@@ -405,13 +469,48 @@ export function UploadClient() {
 
       <section className="grid gap-4">
         <div className="rounded-lg border border-slate-200 bg-white p-5">
-          <h3 className="font-semibold">最近上传</h3>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <h3 className="font-semibold">最近上传</h3>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={toggleSelectAllFiles}
+                disabled={files.length === 0}
+                className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {allFilesSelected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                {allFilesSelected ? "取消全选" : "全选"}
+              </button>
+              <button
+                type="button"
+                onClick={deleteSelectedFiles}
+                disabled={!hasSelectedFiles || isDeletingFiles}
+                className="inline-flex items-center justify-center gap-2 rounded-md bg-coral px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isDeletingFiles ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                删除已选
+              </button>
+            </div>
+          </div>
           {isLoading ? <p className="mt-4 text-sm text-slate-500">正在加载...</p> : null}
           {!isLoading && files.length === 0 ? <p className="mt-4 text-sm text-slate-500">暂无上传记录。</p> : null}
           <div className="mt-4 grid gap-3">
             {files.map((file) => (
-              <article key={file.id} className="rounded-md bg-slate-50 p-4">
+              <article
+                key={file.id}
+                className={`rounded-md border p-4 transition ${
+                  selectedFileIds.includes(file.id) ? "border-coral/60 bg-red-50 ring-2 ring-coral/10" : "border-transparent bg-slate-50"
+                }`}
+              >
                 <div className="flex items-start gap-3">
+                  <button
+                    type="button"
+                    onClick={() => toggleFileSelected(file.id)}
+                    className="mt-0.5 text-slate-400 hover:text-coral"
+                    aria-label={selectedFileIds.includes(file.id) ? "取消选择文件" : "选择文件"}
+                  >
+                    {selectedFileIds.includes(file.id) ? <CheckSquare className="h-5 w-5" /> : <Square className="h-5 w-5" />}
+                  </button>
                   {isExcelFile(file) ? (
                     <FileSpreadsheet className="mt-0.5 h-5 w-5 text-brand" />
                   ) : (
@@ -422,6 +521,7 @@ export function UploadClient() {
                     <p className="mt-1 text-xs text-slate-500">
                       {customerMap.get(file.customer_id ?? "")?.name ?? "未知客户"} · {formatSize(file.file_size)}
                     </p>
+                    <p className="mt-1 text-xs text-slate-400">上传时间：{formatDateTime(file.created_at)}</p>
                   </div>
                 </div>
               </article>
@@ -437,6 +537,18 @@ function formatSize(size: number | null) {
   if (!size) return "未知大小";
   if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatDateTime(value: string) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(new Date(value));
 }
 
 function isAllowedFile(file: File, format: UploadFormat) {

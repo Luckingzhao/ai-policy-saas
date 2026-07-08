@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
-import { Download, FileSpreadsheet, Loader2, Plus, Search, Upload, UserRound } from "lucide-react";
+import { CheckSquare, Download, FileSpreadsheet, Loader2, Plus, Search, Square, Trash2, Upload, UserRound } from "lucide-react";
 import { EmptyState } from "@/components/ui";
 import { createBrowserSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/database.types";
@@ -35,6 +35,8 @@ export function CustomersClient() {
   const [form, setForm] = useState<CustomerForm>(initialForm);
   const [query, setQuery] = useState("");
   const [message, setMessage] = useState("");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
@@ -60,6 +62,7 @@ export function CustomersClient() {
       setMessage(error.message);
     } else {
       setCustomers(data ?? []);
+      setSelectedIds((current) => current.filter((id) => data?.some((customer) => customer.id === id)));
     }
     setIsLoading(false);
   }
@@ -178,10 +181,56 @@ export function CustomersClient() {
     XLSX.writeFile(workbook, `客户档案_${formatExportDate(new Date())}.xlsx`);
   }
 
+  function toggleSelected(customerId: string) {
+    setSelectedIds((current) => (current.includes(customerId) ? current.filter((id) => id !== customerId) : [...current, customerId]));
+  }
+
+  function toggleSelectAll() {
+    const filteredIds = filteredCustomers.map((customer) => customer.id);
+    if (filteredIds.length > 0 && selectedIds.length === filteredIds.length) {
+      setSelectedIds([]);
+      return;
+    }
+
+    setSelectedIds(filteredIds);
+  }
+
+  async function deleteSelectedCustomers() {
+    const ids = [...new Set(selectedIds)].filter(Boolean);
+    if (ids.length === 0) return;
+
+    if (!window.confirm(`确认删除已选中的 ${ids.length} 位客户吗？删除客户可能会影响其关联保单和报告，请谨慎操作。`)) return;
+
+    setMessage("");
+    setIsDeleting(true);
+
+    const { data: userData, error: userError } = await supabase.auth.getUser();
+    if (userError || !userData.user) {
+      setMessage("请先登录后再删除客户。");
+      setIsDeleting(false);
+      return;
+    }
+
+    const { error } = await supabase.from("customers").delete().eq("user_id", userData.user.id).in("id", ids);
+    setIsDeleting(false);
+
+    if (error) {
+      setMessage(error.message);
+      return;
+    }
+
+    setSelectedIds([]);
+    setMessage(`已删除 ${ids.length} 位客户。`);
+    await loadCustomers();
+  }
+
   const filteredCustomers = customers.filter((customer) => {
     const haystack = `${customer.name} ${customer.phone ?? ""} ${customer.wechat_id ?? ""} ${customer.city ?? ""}`;
     return haystack.toLowerCase().includes(query.toLowerCase());
   });
+  const filteredIds = filteredCustomers.map((customer) => customer.id);
+  const allSelected = filteredIds.length > 0 && selectedIds.length === filteredIds.length;
+  const hasSelection = selectedIds.length > 0;
 
   return (
     <div className="grid gap-5 lg:grid-cols-[0.9fr_1.1fr]">
@@ -243,32 +292,54 @@ export function CustomersClient() {
 
       <section>
         <div className="mb-4 grid gap-3">
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={() => importInputRef.current?.click()}
-              disabled={isImporting}
-              className="inline-flex items-center justify-center gap-2 rounded-md bg-brand px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {isImporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-              Excel 导入客户
-            </button>
-            <button
-              type="button"
-              onClick={handleExport}
-              disabled={customers.length === 0}
-              className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-600 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              <Download className="h-4 w-4" />
-              导出客户 Excel
-            </button>
-            <input
-              ref={importInputRef}
-              type="file"
-              accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
-              className="sr-only"
-              onChange={handleImport}
-            />
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => importInputRef.current?.click()}
+                disabled={isImporting}
+                className="inline-flex items-center justify-center gap-2 rounded-md bg-brand px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isImporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                Excel 导入客户
+              </button>
+              <button
+                type="button"
+                onClick={handleExport}
+                disabled={customers.length === 0}
+                className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-600 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Download className="h-4 w-4" />
+                导出客户 Excel
+              </button>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+                className="sr-only"
+                onChange={handleImport}
+              />
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={toggleSelectAll}
+                disabled={filteredCustomers.length === 0}
+                className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {allSelected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                {allSelected ? "取消全选" : "全选"}
+              </button>
+              <button
+                type="button"
+                onClick={deleteSelectedCustomers}
+                disabled={!hasSelection || isDeleting}
+                className="inline-flex items-center justify-center gap-2 rounded-md bg-coral px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isDeleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                删除已选
+              </button>
+            </div>
           </div>
 
           <label className="relative block">
@@ -303,8 +374,21 @@ export function CustomersClient() {
 
         <div className="grid gap-3">
           {filteredCustomers.map((customer) => (
-            <article key={customer.id} className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+            <article
+              key={customer.id}
+              className={`rounded-lg border bg-white p-5 shadow-sm transition ${
+                selectedIds.includes(customer.id) ? "border-coral/60 ring-2 ring-coral/10" : "border-slate-200"
+              }`}
+            >
               <div className="flex items-start gap-3">
+                <button
+                  type="button"
+                  onClick={() => toggleSelected(customer.id)}
+                  className="mt-2 text-slate-400 hover:text-coral"
+                  aria-label={selectedIds.includes(customer.id) ? "取消选择客户" : "选择客户"}
+                >
+                  {selectedIds.includes(customer.id) ? <CheckSquare className="h-5 w-5" /> : <Square className="h-5 w-5" />}
+                </button>
                 <span className="flex h-10 w-10 items-center justify-center rounded-md bg-red-50 text-brand">
                   <UserRound className="h-5 w-5" />
                 </span>
@@ -313,6 +397,7 @@ export function CustomersClient() {
                   <p className="mt-2 text-sm text-slate-500">
                     {customer.phone || "未填手机号"} · {customer.wechat_id || "未填微信"} · {customer.city || "未填城市"}
                   </p>
+                  <p className="mt-1 text-xs text-slate-400">创建时间：{formatDateTime(customer.created_at)}</p>
                   {customer.notes ? <p className="mt-3 text-sm leading-6 text-slate-600">{customer.notes}</p> : null}
                 </div>
               </div>
@@ -410,6 +495,18 @@ function formatGender(value: string | null) {
 
 function formatDateValue(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function formatDateTime(value: string) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(new Date(value));
 }
 
 function formatExportDate(date: Date) {

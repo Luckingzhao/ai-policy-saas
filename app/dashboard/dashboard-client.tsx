@@ -49,6 +49,7 @@ export function DashboardClient() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [advisorName, setAdvisorName] = useState("保险顾问");
+  const [greeting, setGreeting] = useState(() => getTimeGreeting());
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
@@ -103,6 +104,11 @@ export function DashboardClient() {
     loadDashboard();
   }, [supabase]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => setGreeting(getTimeGreeting()), 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const customerMap = new Map(customers.map((customer) => [customer.id, customer.name]));
 
   return (
@@ -115,7 +121,9 @@ export function DashboardClient() {
               <span>AI 家庭保障顾问平台</span>
               <span className="rounded bg-white px-2 py-0.5 text-xs text-brand shadow-sm">{getPlanLabel(subscription?.plan_code)}</span>
             </div>
-            <h2 className="mt-5 text-2xl font-semibold text-ink sm:text-3xl">早上好，{advisorName}</h2>
+            <h2 className="mt-5 text-2xl font-semibold text-ink sm:text-3xl">
+              {greeting}，{advisorName}
+            </h2>
             <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-500">
               今天可以从客户资料、保单上传、报告核对三个环节推进服务，让客户更快看懂自己的家庭保障。
             </p>
@@ -319,6 +327,14 @@ function reportStatusText(status: Report["status"]) {
   if (status === "published") return "已发布";
   if (status === "archived") return "已归档";
   return "草稿";
+}
+
+function getTimeGreeting() {
+  const hour = new Date().getHours();
+  if (hour >= 5 && hour < 11) return "早上好";
+  if (hour >= 11 && hour < 14) return "中午好";
+  if (hour >= 14 && hour < 18) return "下午好";
+  return "晚上好";
 }
 
 function formatDate(value: string) {
