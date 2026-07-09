@@ -70,7 +70,10 @@ export function AuthForm({ mode }: AuthFormProps) {
           <div className="flex h-11 w-11 items-center justify-center rounded-md bg-brand">
             <ShieldCheck className="h-6 w-6" />
           </div>
-          <h1 className="mt-8 text-3xl font-semibold leading-tight">AI 家庭保障顾问平台</h1>
+          <h1 className="mt-8 break-keep text-3xl font-semibold leading-tight">
+            <span className="block sm:inline">AI 家庭保障</span>
+            <span className="block sm:inline">顾问平台</span>
+          </h1>
           <div className="mt-10 grid gap-3 text-sm text-white/80">
             <span>独立业务员账号</span>
             <span>独立客户与保单数据</span>

@@ -167,8 +167,9 @@ export function LoginLanding() {
                 </div>
               </div>
 
-              <h1 className="mt-8 max-w-4xl text-4xl font-semibold leading-tight tracking-normal sm:text-5xl xl:whitespace-nowrap xl:text-[56px]">
-                AI 家庭保障顾问平台
+              <h1 className="mt-8 max-w-4xl break-keep text-[38px] font-semibold leading-[1.12] tracking-normal sm:text-5xl xl:whitespace-nowrap xl:text-[56px]">
+                <span className="block sm:inline">AI 家庭保障</span>
+                <span className="block sm:inline">顾问平台</span>
               </h1>
               <p className="mt-5 max-w-2xl text-base leading-8 text-slate-600 sm:text-lg">
                 专为保险业务员打造，一站式完成保单整理、客户管理、家庭保障分析与专业报告生成，让 AI 成为您的专属保险助理。
