@@ -373,11 +373,12 @@ export async function POST(request: Request, context: RouteContext) {
 
 async function extractPdfText(buffer: Buffer) {
   ensurePdfJsNodePolyfills();
+  const worker = await import("pdfjs-dist/legacy/build/pdf.worker.mjs");
+  (globalThis as typeof globalThis & { pdfjsWorker?: typeof worker }).pdfjsWorker = worker;
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  pdfjs.GlobalWorkerOptions.workerSrc = "";
+  pdfjs.GlobalWorkerOptions.workerSrc = "./pdf.worker.mjs";
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(buffer),
-    disableWorker: true,
     useSystemFonts: true
   } as Parameters<typeof pdfjs.getDocument>[0]);
   const document = await loadingTask.promise;
