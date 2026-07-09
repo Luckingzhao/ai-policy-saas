@@ -635,7 +635,7 @@ async function loadReportAttachments(supabase: ReturnType<typeof createBrowserSu
 
 function getPublicAttachmentUrl(reportId: string, attachmentId: string) {
   const origin = typeof window !== "undefined" ? window.location.origin : process.env.NEXT_PUBLIC_APP_URL || "";
-  const path = `/api/report-attachments/${encodeURIComponent(reportId)}/${encodeURIComponent(attachmentId)}`;
+  const path = `/report-attachments/${encodeURIComponent(reportId)}/${encodeURIComponent(attachmentId)}`;
   return origin ? `${origin}${path}` : path;
 }
 
