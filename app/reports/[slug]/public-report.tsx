@@ -180,7 +180,7 @@ export function PublicReport({ slug, reportId, preview = false }: { slug?: strin
               supabase.from("policy_benefits").select("*").in("policy_id", policyIds)
             ])
           : [{ data: [] }, { data: [] }];
-      const attachments = await loadReportAttachments(supabase, report);
+      const attachments = await loadReportAttachments(supabase, report, preview);
 
       setData({
         report,
@@ -549,16 +549,18 @@ function getDisplayPolicies(summary: Json, policies: Policy[], beneficiaries: Be
   }));
 }
 
-async function loadReportAttachments(supabase: ReturnType<typeof createBrowserSupabaseClient>, report: Report): Promise<Attachment[]> {
+async function loadReportAttachments(supabase: ReturnType<typeof createBrowserSupabaseClient>, report: Report, preview: boolean): Promise<Attachment[]> {
   const manualAttachments = await Promise.all(
     getManualAttachments(report.summary).map(async (attachment) => {
-      const { data: signedUrl } = await supabase.storage.from(attachment.bucket).createSignedUrl(attachment.object_path, 60 * 60);
+      const signedUrl = preview
+        ? (await supabase.storage.from(attachment.bucket).createSignedUrl(attachment.object_path, 60 * 60)).data?.signedUrl
+        : getPublicAttachmentUrl(report.id, attachment.id);
       return {
         id: attachment.id,
         name: attachment.original_filename,
         mimeType: attachment.mime_type,
         fileSize: attachment.file_size,
-        url: signedUrl?.signedUrl ?? null
+        url: signedUrl ?? null
       };
     })
   );
@@ -581,6 +583,19 @@ async function loadReportAttachments(supabase: ReturnType<typeof createBrowserSu
         ]
       : [];
     return [...manualAttachments, ...fallback];
+  }
+
+  if (!preview) {
+    return [
+      ...manualAttachments,
+      {
+        id: sourceFileId,
+        name: originalFilename || "原始上传文件",
+        mimeType: null,
+        fileSize: null,
+        url: getPublicAttachmentUrl(report.id, sourceFileId)
+      }
+    ];
   }
 
   const { data: file } = await supabase
@@ -616,6 +631,10 @@ async function loadReportAttachments(supabase: ReturnType<typeof createBrowserSu
       url: signedUrl?.signedUrl ?? null
     }
   ];
+}
+
+function getPublicAttachmentUrl(reportId: string, attachmentId: string) {
+  return `/api/report-attachments/${encodeURIComponent(reportId)}/${encodeURIComponent(attachmentId)}`;
 }
 
 function getManualAttachments(summary: Json): AttachmentMeta[] {

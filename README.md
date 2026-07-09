@@ -74,6 +74,7 @@ npm run dev
 3. 配置环境变量：
    - `NEXT_PUBLIC_SUPABASE_URL`
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY`，仅服务端使用，用于公开 H5 附件生成临时访问链接
    - `OPENAI_API_KEY`，使用 OpenAI 官方 API 时填写
    - `DEEPSEEK_API_KEY`，使用 DeepSeek 时填写，填写后会优先使用 DeepSeek
    - `DEEPSEEK_MODEL`，可选，默认 `deepseek-v4-flash`
