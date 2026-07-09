@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
-import path from "node:path";
 import type { Database, Json } from "@/lib/supabase/database.types";
 
 export const runtime = "nodejs";
@@ -373,12 +372,14 @@ export async function POST(request: Request, context: RouteContext) {
 }
 
 async function extractPdfText(buffer: Buffer) {
+  ensurePdfJsNodePolyfills();
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  pdfjs.GlobalWorkerOptions.workerSrc = path.join(process.cwd(), "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs");
+  pdfjs.GlobalWorkerOptions.workerSrc = "";
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(buffer),
+    disableWorker: true,
     useSystemFonts: true
-  });
+  } as Parameters<typeof pdfjs.getDocument>[0]);
   const document = await loadingTask.promise;
   const pages: string[] = [];
 
@@ -398,6 +399,89 @@ async function extractPdfText(buffer: Buffer) {
   }
 
   return buildStablePdfText(pages);
+}
+
+function ensurePdfJsNodePolyfills() {
+  if (typeof globalThis.DOMMatrix !== "undefined") return;
+
+  class MinimalDOMMatrix {
+    a = 1;
+    b = 0;
+    c = 0;
+    d = 1;
+    e = 0;
+    f = 0;
+
+    constructor(init?: number[] | string) {
+      if (Array.isArray(init)) {
+        this.a = Number(init[0] ?? 1);
+        this.b = Number(init[1] ?? 0);
+        this.c = Number(init[2] ?? 0);
+        this.d = Number(init[3] ?? 1);
+        this.e = Number(init[4] ?? 0);
+        this.f = Number(init[5] ?? 0);
+      }
+    }
+
+    multiplySelf(other: MinimalDOMMatrix) {
+      const a = this.a * other.a + this.c * other.b;
+      const b = this.b * other.a + this.d * other.b;
+      const c = this.a * other.c + this.c * other.d;
+      const d = this.b * other.c + this.d * other.d;
+      const e = this.a * other.e + this.c * other.f + this.e;
+      const f = this.b * other.e + this.d * other.f + this.f;
+      this.a = a;
+      this.b = b;
+      this.c = c;
+      this.d = d;
+      this.e = e;
+      this.f = f;
+      return this;
+    }
+
+    preMultiplySelf(other: MinimalDOMMatrix) {
+      const matrix = new MinimalDOMMatrix([other.a, other.b, other.c, other.d, other.e, other.f]);
+      matrix.multiplySelf(this);
+      this.a = matrix.a;
+      this.b = matrix.b;
+      this.c = matrix.c;
+      this.d = matrix.d;
+      this.e = matrix.e;
+      this.f = matrix.f;
+      return this;
+    }
+
+    translate(x = 0, y = 0) {
+      return new MinimalDOMMatrix([this.a, this.b, this.c, this.d, this.e + x, this.f + y]);
+    }
+
+    scale(scaleX = 1, scaleY = scaleX) {
+      return new MinimalDOMMatrix([this.a * scaleX, this.b * scaleX, this.c * scaleY, this.d * scaleY, this.e, this.f]);
+    }
+
+    invertSelf() {
+      const determinant = this.a * this.d - this.b * this.c || 1;
+      const a = this.d / determinant;
+      const b = -this.b / determinant;
+      const c = -this.c / determinant;
+      const d = this.a / determinant;
+      const e = (this.c * this.f - this.d * this.e) / determinant;
+      const f = (this.b * this.e - this.a * this.f) / determinant;
+      this.a = a;
+      this.b = b;
+      this.c = c;
+      this.d = d;
+      this.e = e;
+      this.f = f;
+      return this;
+    }
+  }
+
+  Object.defineProperty(globalThis, "DOMMatrix", {
+    value: MinimalDOMMatrix,
+    configurable: true,
+    writable: true
+  });
 }
 
 function buildStablePdfText(pages: string[]) {
