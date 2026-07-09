@@ -336,7 +336,7 @@ function AttachmentsSection({ attachments }: { attachments: Attachment[] }) {
               key={attachment.id}
               href={attachment.url}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               className="flex items-center justify-between gap-3 rounded-md border border-slate-100 bg-[#fbfcfe] px-3 py-3"
             >
               <span className="min-w-0">
@@ -634,7 +634,9 @@ async function loadReportAttachments(supabase: ReturnType<typeof createBrowserSu
 }
 
 function getPublicAttachmentUrl(reportId: string, attachmentId: string) {
-  return `/api/report-attachments/${encodeURIComponent(reportId)}/${encodeURIComponent(attachmentId)}`;
+  const origin = typeof window !== "undefined" ? window.location.origin : process.env.NEXT_PUBLIC_APP_URL || "";
+  const path = `/api/report-attachments/${encodeURIComponent(reportId)}/${encodeURIComponent(attachmentId)}`;
+  return origin ? `${origin}${path}` : path;
 }
 
 function getManualAttachments(summary: Json): AttachmentMeta[] {
