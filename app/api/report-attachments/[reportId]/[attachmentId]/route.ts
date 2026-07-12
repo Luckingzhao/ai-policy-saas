@@ -11,7 +11,7 @@ type RouteContext = {
   }>;
 };
 
-type Report = Pick<Database["public"]["Tables"]["h5_reports"]["Row"], "id" | "status" | "summary">;
+type Report = Pick<Database["public"]["Tables"]["h5_reports"]["Row"], "id" | "user_id" | "status" | "summary">;
 type ReportFile = Pick<
   Database["public"]["Tables"]["report_files"]["Row"],
   "id" | "bucket" | "object_path" | "original_filename"
@@ -45,7 +45,7 @@ export async function GET(_request: Request, context: RouteContext) {
 
   const { data: report, error: reportError } = await supabase
     .from("h5_reports")
-    .select("id,status,summary")
+    .select("id,user_id,status,summary")
     .eq("id", reportId)
     .eq("status", "published")
     .maybeSingle<Report>();
@@ -77,7 +77,7 @@ async function resolveAttachment(
 ): Promise<Pick<AttachmentMeta, "bucket" | "object_path" | "original_filename"> | null> {
   const manualAttachment = getManualAttachments(report.summary).find((attachment) => attachment.id === attachmentId);
   if (manualAttachment) {
-    return manualAttachment;
+    return isTenantOwnedAttachment(manualAttachment, report.user_id) ? manualAttachment : null;
   }
 
   if (isSourceAttachmentHidden(report.summary)) {
@@ -93,9 +93,16 @@ async function resolveAttachment(
     .from("report_files")
     .select("id,bucket,object_path,original_filename")
     .eq("id", sourceFileId)
+    .eq("user_id", report.user_id)
     .maybeSingle<ReportFile>();
 
   return file ?? null;
+}
+
+function isTenantOwnedAttachment(attachment: AttachmentMeta, userId: string) {
+  const allowedBuckets = new Set(["policy-pdfs", "report-assets"]);
+  const normalizedPath = attachment.object_path.replace(/^\/+/, "");
+  return allowedBuckets.has(attachment.bucket) && normalizedPath.startsWith(`${userId}/`);
 }
 
 function getManualAttachments(summary: Json): AttachmentMeta[] {
