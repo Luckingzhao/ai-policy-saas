@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 import type { Database, Json } from "@/lib/supabase/database.types";
+import { getAiRuntimes, isRetryableGatewayError, type AiRuntime } from "@/lib/ai/gateway";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -23,6 +24,7 @@ type ParsedPolicy = {
   }>;
   insurer?: string | null;
   main_policy_name?: string | null;
+  product_category?: "年金" | "增额寿" | "重疾" | "医疗" | null;
   product_info?: string | null;
   insurance_type?: "重疾险" | "医疗险" | "意外险" | "年金险" | "寿险" | "其他" | null;
   coverage_amount?: number | string | null;
@@ -33,6 +35,18 @@ type ParsedPolicy = {
   remaining_years?: number | string | null;
   remaining_premium?: number | string | null;
   policy_service?: string | null;
+  core_benefits?: string | null;
+  major_disease_benefit?: string | null;
+  moderate_disease_benefit?: string | null;
+  mild_disease_benefit?: string | null;
+  death_benefit?: string | null;
+  total_disability_benefit?: string | null;
+  terminal_illness_benefit?: string | null;
+  other_benefits?: string | null;
+  premium_waiver?: string | null;
+  exclusions?: string | null;
+  cash_value_returns?: string | null;
+  product_constraints?: string | null;
   benefit_details?: Array<{
     name?: string | null;
     type?: string | null;
@@ -77,12 +91,17 @@ const requiredFields: Array<keyof ParsedPolicy> = [
   "effective_date"
 ];
 
+const policyBuilderRequiredFields: Array<keyof ParsedPolicy> = [
+  "main_policy_name",
+  "product_category",
+  "coverage_amount",
+  "annual_premium",
+  "payment_period"
+];
+
 export async function POST(request: Request, context: RouteContext) {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  const deepSeekKey = process.env.DEEPSEEK_API_KEY;
-  const openRouterKey = process.env.OPENROUTER_API_KEY;
-  const openaiKey = openRouterKey || deepSeekKey || process.env.OPENAI_API_KEY;
 
   if (!supabaseUrl || !supabaseAnonKey) {
     return NextResponse.json({ error: "Supabase 环境变量未配置。" }, { status: 500 });
@@ -122,6 +141,7 @@ export async function POST(request: Request, context: RouteContext) {
   if (reportError || !report) {
     return NextResponse.json({ error: "报告不存在或无权访问。" }, { status: 404 });
   }
+  const isPolicyBuilder = isPlainObject(report.summary) && report.summary.module === "policy_builder";
 
   const reportFileId = getReportFileId(report.summary);
   if (!reportFileId) {
@@ -140,7 +160,7 @@ export async function POST(request: Request, context: RouteContext) {
   }
 
   try {
-    const sourceFileType = isExcelFile(file.original_filename, file.mime_type) ? "excel" : "pdf";
+    const sourceFileType = getSourceFileType(file.original_filename, file.mime_type);
     const { data: subscription } = await supabase
       .from("subscriptions")
       .select("id")
@@ -170,36 +190,53 @@ export async function POST(request: Request, context: RouteContext) {
     const sourceBuffer = Buffer.from(await sourceBlob.arrayBuffer());
     let policies: ParsedPolicy[] = [];
     let sourceText = "";
-    let reportJsonSource: "policy_pdf_parse" | "policy_excel_parse" = "policy_pdf_parse";
+    let reportJsonSource: "policy_pdf_parse" | "policy_excel_parse" | "policy_word_parse" | "policy_image_parse" = "policy_pdf_parse";
 
     if (sourceFileType === "excel") {
-      policies = await extractPoliciesFromExcel(sourceBuffer);
+      policies = normalizeParsedPolicies(await extractPoliciesFromExcel(sourceBuffer));
       sourceText = buildExcelSourceText(policies);
       reportJsonSource = "policy_excel_parse";
       if (policies.length === 0) {
         throw new Error("未从 Excel 中识别到保单明细。请确认表格包含投保人、被保人、保险公司、主险名称、期缴保费等表头。");
       }
     } else {
-      if (!isPdfFile(file.original_filename, file.mime_type)) {
-        throw new Error("当前自动解析支持 PDF 和 Excel，请上传 .pdf、.xlsx 或 .xls 文件。");
-      }
-      const pdfText = await extractPdfText(sourceBuffer);
-      if (pdfText.trim().length < 20) {
-        throw new Error("PDF 文本内容过少，可能是扫描件或图片型保单。");
+      const aiOptions = getAiRuntimes("policy")[0] ?? null;
+
+      if (sourceFileType === "image") {
+        const visionRuntime = getAiRuntimes("vision")[0] ?? null;
+        if (!visionRuntime) {
+          throw new Error("图片识别需要配置 OPENROUTER_API_KEY 或 OPENAI_API_KEY。");
+        }
+        const parsed = await extractPoliciesFromImage(sourceBuffer, file.mime_type || "image/jpeg", visionRuntime, isPolicyBuilder);
+        policies = enrichPoliciesWithComputedFields(normalizeParsedPolicies(parsed.policies ?? []), "");
+        sourceText = `图片保单资料：${file.original_filename}`;
+        reportJsonSource = "policy_image_parse";
+      } else {
+        let documentText = "";
+        if (sourceFileType === "word") {
+          documentText = await extractWordText(sourceBuffer, file.original_filename);
+          reportJsonSource = "policy_word_parse";
+        } else if (sourceFileType === "pdf") {
+          documentText = await extractPdfText(sourceBuffer);
+        } else {
+          throw new Error("当前支持图片、PDF、Excel 和 DOCX 文件。");
+        }
+
+        if (documentText.trim().length < 20) {
+          throw new Error(sourceFileType === "word" ? "Word 文档文字内容过少，无法识别保单信息。" : "PDF 文本内容过少，请改用图片格式上传或先进行 OCR。");
+        }
+
+        const cleanedText = isPolicyBuilder ? cleanInsuranceSolutionText(documentText) : documentText;
+        const localPolicies = extractPoliciesWithLocalRules(cleanedText);
+        const parsed = isPolicyBuilder && aiOptions
+          ? await extractSolutionPoliciesWithOpenAI(cleanedText, aiOptions)
+          : await extractPoliciesWithBestAvailableMethod(cleanedText, localPolicies, aiOptions);
+        policies = enrichPoliciesWithComputedFields(normalizeParsedPolicies(parsed.policies ?? []), cleanedText);
+        sourceText = cleanedText;
       }
 
-      const localPolicies = extractPoliciesWithLocalRules(pdfText);
-      const aiOptions = openaiKey
-        ? {
-            apiKey: openaiKey,
-            provider: openRouterKey ? ("openrouter" as const) : deepSeekKey ? ("deepseek" as const) : ("openai" as const)
-          }
-        : null;
-      const parsed = await extractPoliciesWithBestAvailableMethod(pdfText, localPolicies, aiOptions);
-      policies = enrichPoliciesWithComputedFields(parsed.policies ?? [], pdfText);
-      sourceText = pdfText;
       if (policies.length === 0) {
-        throw new Error("未从 PDF 中识别到保单信息。");
+        throw new Error("未从上传资料中识别到保单信息。");
       }
     }
 
@@ -221,7 +258,7 @@ export async function POST(request: Request, context: RouteContext) {
     for (const policy of policies) {
       const key = policyKey(policy.insured, policy.main_policy_name, policy.effective_date);
       const displayName = policy.main_policy_name || policy.insured || "未命名保单";
-      const missing = requiredFields.filter((field) => isBlank(policy[field])).map(fieldLabel);
+      const missing = (isPolicyBuilder ? policyBuilderRequiredFields : requiredFields).filter((field) => isBlank(policy[field])).map(fieldLabel);
       if (missing.length > 0) {
         missingFields.push({ policy: displayName, fields: missing });
       }
@@ -230,6 +267,9 @@ export async function POST(request: Request, context: RouteContext) {
       const remainingPremium = toNumber(policy.remaining_premium);
       annualPremiums.push(annualPremium);
       remainingPremiums.push(remainingPremium);
+
+      // 候选方案保存在 report_json，不写入客户“现有保单”表。
+      if (isPolicyBuilder) continue;
 
       if (!key || seenKeys.has(key) || existingPolicies.has(key)) {
         duplicateCount += 1;
@@ -303,8 +343,9 @@ export async function POST(request: Request, context: RouteContext) {
       }
     }
 
+    const storedPolicyCount = isPolicyBuilder ? policies.length : insertedCount;
     const verificationRounds = buildVerificationRounds(sourceText, policies, {
-      insertedCount,
+      insertedCount: storedPolicyCount,
       duplicateCount,
       missingFields,
       annualPremiumTotal: roundMoney(sum(annualPremiums)),
@@ -314,7 +355,7 @@ export async function POST(request: Request, context: RouteContext) {
     const verification = {
       quality_status: qualityStatus,
       total_policy_count: policies.length,
-      inserted_policy_count: insertedCount,
+      inserted_policy_count: storedPolicyCount,
       annual_premium_total: roundMoney(sum(annualPremiums)),
       remaining_premium_total: roundMoney(sum(remainingPremiums)),
       has_duplicate_policies: duplicateCount > 0,
@@ -341,16 +382,37 @@ export async function POST(request: Request, context: RouteContext) {
         report_id: report.id,
         customer_id: report.customer_id,
         file_id: file.id,
+        ...(isPolicyBuilder
+          ? {
+              source_text:
+                sourceFileType === "pdf" || sourceFileType === "word"
+                  ? sanitizeUnicodeText(sourceText).slice(0, 60000)
+                  : sanitizeUnicodeText(buildDetailedSolutionText(policies)).slice(0, 60000),
+              analysis_status: "pending"
+            }
+          : {}),
         verification,
         policies
       },
       extracted_policies: policies
     };
 
-    await supabase.from("report_files").update({ parse_status: "completed", parse_error: null }).eq("id", file.id).eq("user_id", userId);
-    await supabase.from("h5_reports").update({ summary: nextSummary as Json }).eq("id", report.id).eq("user_id", userId);
+    const { error: fileCompleteError } = await supabase
+      .from("report_files")
+      .update({ parse_status: "completed", parse_error: null })
+      .eq("id", file.id)
+      .eq("user_id", userId);
+    if (fileCompleteError) throw new Error(`文件解析状态保存失败：${fileCompleteError.message}`);
 
-    return NextResponse.json({ ok: true, verification });
+    const safeSummary = sanitizeJsonForPostgres(nextSummary);
+    const { error: reportSaveError } = await supabase
+      .from("h5_reports")
+      .update({ summary: safeSummary })
+      .eq("id", report.id)
+      .eq("user_id", userId);
+    if (reportSaveError) throw new Error(`评测 JSON 保存失败：${reportSaveError.message}`);
+
+    return NextResponse.json({ ok: true, policy_count: policies.length, verification });
   } catch (error) {
     const message = error instanceof Error ? error.message : "解析失败。";
     await supabase.from("report_files").update({ parse_status: "failed", parse_error: message }).eq("id", file.id).eq("user_id", userId);
@@ -400,6 +462,69 @@ async function extractPdfText(buffer: Buffer) {
   }
 
   return buildStablePdfText(pages);
+}
+
+async function extractWordText(buffer: Buffer, filename: string) {
+  if (!filename.toLowerCase().endsWith(".docx")) {
+    throw new Error("暂不支持旧版 .doc 文件，请在 Word 中另存为 .docx 后上传。");
+  }
+
+  const CFB = await import("cfb");
+  const container = CFB.read(new Uint8Array(buffer), { type: "buffer" });
+  const documentEntry = CFB.find(container, "word/document.xml");
+  if (!documentEntry?.content) throw new Error("无法读取 DOCX 正文，请确认文件未损坏。");
+
+  return Buffer.from(documentEntry.content)
+    .toString("utf8")
+    .replace(/<w:tab\s*\/>/g, "\t")
+    .replace(/<w:(?:br|cr)\s*\/>/g, "\n")
+    .replace(/<\/w:p>/g, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function extractPoliciesFromImage(
+  buffer: Buffer,
+  mimeType: string,
+  runtime: AiRuntime,
+  isPolicyBuilder = false
+): Promise<ParsedPayload> {
+  const dataUrl = `data:${mimeType};base64,${buffer.toString("base64")}`;
+  const completion = await createChatCompletionWithRetry(
+    runtime.client,
+    {
+      model: runtime.model,
+      temperature: 0,
+      max_tokens: 3000,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: "你是保险保单图片结构化解析助手。只输出 JSON，不输出解释。缺失字段用 null，金额输出数字，日期输出 YYYY-MM-DD。"
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: isPolicyBuilder ? buildSolutionImagePrompt() : `识别图片中的全部保单，按以下紧凑 JSON 输出：\n{\"policies\":[{\"policy_holder\":\"投保人\",\"insured\":\"被保人\",\"beneficiaries\":[{\"name\":\"受益人\",\"relationship\":\"关系\",\"ratio\":100,\"type\":\"法定/指定\"}],\"insurer\":\"保险公司\",\"main_policy_name\":\"主险名称\",\"product_info\":\"产品信息\",\"insurance_type\":\"重疾险/医疗险/意外险/年金险/寿险/其他\",\"coverage_amount\":100000,\"annual_premium\":1000,\"payment_period\":\"缴费期间\",\"effective_date\":\"YYYY-MM-DD\",\"paid_years\":1,\"remaining_years\":19,\"remaining_premium\":19000,\"policy_service\":\"保单服务\",\"benefit_details\":[],\"payment_account\":\"缴费账户\"}]}`
+            },
+            { type: "image_url", image_url: { url: dataUrl, detail: "high" } }
+          ]
+        }
+      ]
+    },
+    1
+  );
+  const content = getCompletionContent(completion);
+  if (!content) throw new Error("模型未返回图片解析结果。");
+  return parseModelJson(content);
 }
 
 function ensurePdfJsNodePolyfills() {
@@ -506,9 +631,14 @@ async function extractPoliciesFromExcel(buffer: Buffer): Promise<ParsedPolicy[]>
     cellFormula: true
   });
 
-  for (const sheetName of workbook.SheetNames) {
+    for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName];
     if (!sheet?.["!ref"]) continue;
+
+    const comparisonPolicies = extractComparisonMatrixPolicies(sheet, XLSX);
+    if (comparisonPolicies.length > 0) {
+      return enrichPoliciesWithComputedFields(comparisonPolicies, buildExcelSourceText(comparisonPolicies));
+    }
 
     const range = XLSX.utils.decode_range(sheet["!ref"]);
     const header = findPolicyHeaderRow(sheet, range, XLSX);
@@ -566,6 +696,160 @@ async function extractPoliciesFromExcel(buffer: Buffer): Promise<ParsedPolicy[]>
   }
 
   return [];
+}
+
+function extractComparisonMatrixPolicies(sheet: Record<string, unknown>, XLSX: typeof import("xlsx")): ParsedPolicy[] {
+  const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", raw: false }) as unknown as Array<Array<unknown>>;
+  const productRowIndex = matrix.findIndex((row) => normalizeHeader(row[0]) === "产品名称");
+  if (productRowIndex < 0) return [];
+
+  const labels = new Map<string, number>();
+  for (let rowIndex = productRowIndex; rowIndex < matrix.length; rowIndex += 1) {
+    const label = normalizeSolutionRowLabel(matrix[rowIndex]?.[0]);
+    if (label) labels.set(label, rowIndex);
+  }
+  const requiredLabels = ["产品名称", "年缴费", "重大疾病保险金"];
+  if (!requiredLabels.every((label) => labels.has(label))) return [];
+
+  const titleText = matrix.slice(0, productRowIndex).flat().map((value) => String(value ?? "")).join(" ");
+  const productRow = matrix[productRowIndex] ?? [];
+  const policies: ParsedPolicy[] = [];
+  for (let columnIndex = 1; columnIndex < productRow.length; columnIndex += 1) {
+    const productName = cleanCellText(productRow[columnIndex]);
+    if (!productName) continue;
+
+    const value = (label: string) => {
+      const rowIndex = labels.get(label);
+      return rowIndex === undefined ? null : emptyToNull(cleanCellText(matrix[rowIndex]?.[columnIndex]));
+    };
+    const major = value("重大疾病保险金");
+    const moderate = value("中度疾病保险金");
+    const mild = value("轻度疾病保险金");
+    const death = value("身故保险金");
+    const disability = value("全残保险金");
+    const terminal = value("疾病终末期");
+    const other = value("其他保险责任");
+    const waiver = value("保费豁免");
+    const coveragePeriod = value("保障期");
+    const paymentPeriod = value("缴费期");
+    const productCategory = inferSolutionProductCategory(`${productName} ${major ?? ""} ${value("现金价值收益") ?? ""}`);
+    const benefitEntries = [
+      ["重大疾病保险金", major],
+      ["中度疾病保险金", moderate],
+      ["轻度疾病保险金", mild],
+      ["身故保险金", death],
+      ["全残保险金", disability],
+      ["疾病终末期", terminal],
+      ["其他保险责任", other],
+      ["保费豁免", waiver]
+    ].filter((entry): entry is [string, string] => Boolean(entry[1]));
+
+    policies.push({
+      policy_holder: null,
+      insured: null,
+      beneficiaries: [],
+      insurer: inferInsurerFromProductName(productName),
+      main_policy_name: productName,
+      product_category: productCategory,
+      product_info: [coveragePeriod ? `保障期：${coveragePeriod}` : null, paymentPeriod ? `缴费期：${paymentPeriod}` : null].filter(Boolean).join("；") || null,
+      insurance_type: mapProductCategoryToInsuranceType(productCategory),
+      coverage_amount: extractCoverageAmountFromText(`${titleText} ${major ?? ""}`),
+      annual_premium: toNumber(value("年缴费")),
+      payment_period: [paymentPeriod ? `缴费期${paymentPeriod}` : null, coveragePeriod ? `保障期${coveragePeriod}` : null].filter(Boolean).join("；") || null,
+      effective_date: null,
+      paid_years: null,
+      remaining_years: null,
+      remaining_premium: null,
+      policy_service: null,
+      core_benefits: benefitEntries.map(([name, description]) => `${name}：${description}`).join("；"),
+      major_disease_benefit: major,
+      moderate_disease_benefit: moderate,
+      mild_disease_benefit: mild,
+      death_benefit: death,
+      total_disability_benefit: disability,
+      terminal_illness_benefit: terminal,
+      other_benefits: other,
+      premium_waiver: waiver,
+      exclusions: value("免责条款"),
+      cash_value_returns: value("现金价值收益"),
+      product_constraints: titleText ? cleanCellText(titleText) : null,
+      benefit_details: benefitEntries.map(([name, description]) => ({
+        name,
+        type: inferBenefitType(name),
+        amount: null,
+        description,
+        waiting_period: null
+      })),
+      payment_account: null
+    });
+  }
+  return policies;
+}
+
+function normalizeSolutionRowLabel(value: unknown) {
+  const label = normalizeHeader(value)
+    .replace(/（元）|\(元\)/g, "")
+    .replace(/现金价值\/收益/g, "现金价值收益");
+  const aliases: Record<string, string> = {
+    年缴费: "年缴费",
+    年交保费: "年缴费",
+    年缴保费: "年缴费",
+    缴费期: "缴费期",
+    缴费期间: "缴费期",
+    保障期: "保障期",
+    保障期间: "保障期",
+    重疾保险金: "重大疾病保险金",
+    重大疾病保险金: "重大疾病保险金",
+    中症保险金: "中度疾病保险金",
+    中度疾病保险金: "中度疾病保险金",
+    轻症保险金: "轻度疾病保险金",
+    轻度疾病保险金: "轻度疾病保险金",
+    身故保险金: "身故保险金",
+    全残保险金: "全残保险金",
+    疾病终末期: "疾病终末期",
+    其他保险责任: "其他保险责任",
+    保费豁免: "保费豁免",
+    免责条款: "免责条款",
+    现金价值收益: "现金价值收益",
+    产品名称: "产品名称"
+  };
+  return aliases[label] ?? label;
+}
+
+function cleanCellText(value: unknown) {
+  return String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+}
+
+function extractCoverageAmountFromText(value: string) {
+  const wanMatch = value.match(/([0-9]+(?:\.[0-9]+)?)\s*万(?:元)?(?:保额)?/);
+  if (wanMatch?.[1]) return roundMoney(Number(wanMatch[1]) * 10000);
+  const yuanMatch = value.match(/保额[^0-9]*([0-9][0-9,.]*)\s*元/);
+  return yuanMatch?.[1] ? toNumber(yuanMatch[1]) : null;
+}
+
+function inferInsurerFromProductName(value: string) {
+  const knownInsurers = ["复星联合", "工银安盛", "北京人寿", "同方全球", "友邦人寿", "中国人寿", "平安人寿", "太平洋人寿", "新华保险", "泰康人寿"];
+  return knownInsurers.find((insurer) => value.includes(insurer)) ?? null;
+}
+
+function inferSolutionProductCategory(value: string): ParsedPolicy["product_category"] {
+  if (/重大疾病|重疾|中症|轻症/.test(value)) return "重疾";
+  if (/医疗|住院|百万医疗|门诊/.test(value)) return "医疗";
+  if (/增额终身寿|增额寿|有效保额.*递增/.test(value)) return "增额寿";
+  if (/年金|养老|教育金|生存金/.test(value)) return "年金";
+  return null;
+}
+
+function mapProductCategoryToInsuranceType(category: ParsedPolicy["product_category"]): ParsedPolicy["insurance_type"] {
+  if (category === "重疾") return "重疾险";
+  if (category === "医疗") return "医疗险";
+  if (category === "增额寿") return "寿险";
+  if (category === "年金") return "年金险";
+  return "其他";
 }
 
 function findPolicyHeaderRow(
@@ -723,31 +1007,31 @@ function buildExcelSourceText(policies: ParsedPolicy[]) {
   return `家庭总保单数量 ${policies.length} 份；家庭年缴总保费 ${totalAnnualPremium} 元；Excel保单明细。`;
 }
 
+function buildDetailedSolutionText(policies: ParsedPolicy[]) {
+  return policies
+    .map((policy, index) => {
+      const fields = [
+        `产品${index + 1}`, `保险公司：${policy.insurer ?? "未提供"}`, `产品名称：${policy.main_policy_name ?? "未提供"}`,
+        `产品分类：${policy.product_category ?? "未提供"}`, `保额：${policy.coverage_amount ?? "未提供"}`,
+        `年交保费：${policy.annual_premium ?? "未提供"}`, `缴费/保障期限：${policy.payment_period ?? "未提供"}`,
+        `核心保障责任：${policy.core_benefits ?? "未提供"}`, `重大疾病保险金：${policy.major_disease_benefit ?? "未提供"}`,
+        `中度疾病保险金：${policy.moderate_disease_benefit ?? "未提供"}`, `轻度疾病保险金：${policy.mild_disease_benefit ?? "未提供"}`,
+        `身故保险金：${policy.death_benefit ?? "未提供"}`, `全残保险金：${policy.total_disability_benefit ?? "未提供"}`,
+        `疾病终末期：${policy.terminal_illness_benefit ?? "未提供"}`, `其他保险责任：${policy.other_benefits ?? "未提供"}`,
+        `保费豁免：${policy.premium_waiver ?? "未提供"}`, `免责条款：${policy.exclusions ?? "未提供"}`,
+        `现金价值/收益：${policy.cash_value_returns ?? "未提供"}`, `产品约束规则：${policy.product_constraints ?? "未提供"}`
+      ];
+      return fields.join("\n");
+    })
+    .join("\n\n");
+}
+
 async function extractPoliciesWithOpenAI(
   pdfText: string,
-  options: {
-    apiKey: string;
-    provider: "openai" | "openrouter" | "deepseek";
-  }
+  runtime: AiRuntime
 ): Promise<ParsedPayload> {
-  const isOpenRouter = options.provider === "openrouter";
-  const isDeepSeek = options.provider === "deepseek";
-  const openai = new OpenAI({
-    apiKey: options.apiKey,
-    timeout: 45000,
-    baseURL: isDeepSeek ? "https://api.deepseek.com" : isOpenRouter ? "https://openrouter.ai/api/v1" : undefined,
-    defaultHeaders: isOpenRouter
-      ? {
-        "HTTP-Referer": process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
-          "X-OpenRouter-Title": "AI Family Protection Advisor"
-        }
-      : undefined
-  });
-  const primaryModel = isDeepSeek
-      ? process.env.DEEPSEEK_MODEL || "deepseek-v4-flash"
-      : isOpenRouter
-        ? process.env.OPENROUTER_MODEL || "deepseek/deepseek-chat"
-        : process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const isOpenRouter = runtime.provider === "openrouter";
+  const primaryModel = runtime.model;
   const models = isOpenRouter ? Array.from(new Set([primaryModel, "deepseek/deepseek-chat"])) : [primaryModel];
   const textLimits = isOpenRouter ? [6000, 3000] : [16000, 8000];
   const relevantText = extractRelevantPolicyText(pdfText);
@@ -756,7 +1040,7 @@ async function extractPoliciesWithOpenAI(
   for (const model of models) {
     for (const textLimit of textLimits) {
       try {
-        const completion = await createChatCompletionWithRetry(openai, {
+        const completion = await createChatCompletionWithRetry(runtime.client, {
           model,
           temperature: 0,
           max_tokens: isOpenRouter ? 1200 : 3000,
@@ -769,6 +1053,7 @@ async function extractPoliciesWithOpenAI(
         return parseModelJson(content);
       } catch (error) {
         lastError = error;
+        if (runtime.provider === "openclaw" && isRetryableGatewayError(error)) break;
         if (!isOpenRouter || (!isRetryableModelError(error) && !isEmptyModelResponse(error))) {
           throw normalizeModelError(error);
         }
@@ -776,15 +1061,9 @@ async function extractPoliciesWithOpenAI(
     }
   }
 
-  if (isOpenRouter && process.env.DEEPSEEK_API_KEY) {
-    try {
-      return await extractPoliciesWithOpenAI(pdfText.slice(0, 8000), {
-        apiKey: process.env.DEEPSEEK_API_KEY,
-        provider: "deepseek"
-      });
-    } catch (error) {
-      lastError = error;
-    }
+  if (isRetryableGatewayError(lastError)) {
+    const fallback = getAiRuntimes("policy").find((candidate) => candidate.provider !== runtime.provider);
+    if (fallback) return extractPoliciesWithOpenAI(pdfText.slice(0, 12000), fallback);
   }
 
   const localPolicies = extractPoliciesWithLocalRules(relevantText);
@@ -798,10 +1077,7 @@ async function extractPoliciesWithOpenAI(
 async function extractPoliciesWithBestAvailableMethod(
   pdfText: string,
   localPolicies: ParsedPolicy[],
-  aiOptions: {
-    apiKey: string;
-    provider: "openai" | "openrouter" | "deepseek";
-  } | null
+  aiOptions: AiRuntime | null
 ): Promise<ParsedPayload> {
   const expectedCount = extractExpectedPolicyCount(pdfText);
   if (isAiaFamilyReport(pdfText) && hasCoreLocalFields(localPolicies) && (!expectedCount || expectedCount === localPolicies.length)) {
@@ -931,6 +1207,86 @@ PDF 文本：
 ${pdfText}`
     }
   ];
+}
+
+async function extractSolutionPoliciesWithOpenAI(
+  sourceText: string,
+  runtime: AiRuntime
+): Promise<ParsedPayload> {
+  try {
+    const completion = await createChatCompletionWithRetry(
+      runtime.client,
+      {
+        model: runtime.model,
+        temperature: 0,
+        max_tokens: 5000,
+        response_format: { type: "json_object" },
+        messages: buildSolutionExtractionMessages(sourceText.slice(0, 30000))
+      },
+      1
+    );
+    const content = getCompletionContent(completion);
+    if (!content) throw new Error("MODEL_EMPTY_RESPONSE");
+    return parseModelJson(content);
+  } catch (error) {
+    if (isRetryableGatewayError(error)) {
+      const fallback = getAiRuntimes("policy").find((candidate) => candidate.provider !== runtime.provider);
+      if (fallback) return extractSolutionPoliciesWithOpenAI(sourceText.slice(0, 18000), fallback);
+    }
+    throw normalizeModelError(error);
+  }
+}
+
+function buildSolutionExtractionMessages(sourceText: string): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+  return [
+    {
+      role: "system",
+      content:
+        "你是保险方案标准化抽取工具。禁止编造，缺失字段必须为 null。产品分类只能是年金、增额寿、重疾、医疗四类之一；无法判断时填 null。只输出 JSON，无解释、无 Markdown。"
+    },
+    {
+      role: "user",
+      content: `以下是已清洗的保险方案原文。请逐个产品抽取标准 JSON。表格横向排列时，每一列视为一个独立产品；碎片化责任需归并到对应产品。金额统一输出人民币元数字。
+
+严格只输出：
+{"policies":[{"policy_holder":null,"insured":null,"insurer":null,"main_policy_name":null,"product_category":null,"coverage_amount":null,"annual_premium":null,"payment_period":null,"core_benefits":null,"major_disease_benefit":null,"moderate_disease_benefit":null,"mild_disease_benefit":null,"death_benefit":null,"total_disability_benefit":null,"terminal_illness_benefit":null,"other_benefits":null,"premium_waiver":null,"exclusions":null,"cash_value_returns":null,"product_constraints":null}]}
+
+监督规则：
+1. 年金：包含年金、养老、教育金、生存金等定期领取责任。
+2. 增额寿：包含增额终身寿、有效保额递增、现金价值增长等特征。
+3. 重疾：包含重大疾病、重疾、中症、轻症等疾病给付责任。
+4. 医疗：包含住院、门诊、医疗费用报销、百万医疗等责任。
+5. 缴费/保障期限合并写入 payment_period，例如“缴费期20年；保障期终身”。
+6. 无法从原文确认投保人、被保人、免责或现金价值时必须填 null。
+
+保险方案原文：
+${sourceText}`
+    }
+  ];
+}
+
+function buildSolutionImagePrompt() {
+  return `先识别并清洗图片中的保险方案文字，再按每个产品输出标准 JSON。修正常见 OCR 错字，合并被拆开的表格文字，删除页眉、水印和广告。禁止编造，缺失字段填 null。产品分类只能是年金、增额寿、重疾、医疗或 null。金额统一为人民币元数字。只输出：
+{"policies":[{"policy_holder":null,"insured":null,"insurer":null,"main_policy_name":null,"product_category":null,"coverage_amount":null,"annual_premium":null,"payment_period":null,"core_benefits":null,"major_disease_benefit":null,"moderate_disease_benefit":null,"mild_disease_benefit":null,"death_benefit":null,"total_disability_benefit":null,"terminal_illness_benefit":null,"other_benefits":null,"premium_waiver":null,"exclusions":null,"cash_value_returns":null,"product_constraints":null}]}`;
+}
+
+function cleanInsuranceSolutionText(sourceText: string) {
+  const corrected = sanitizeUnicodeText(sourceText)
+    .replace(/现介|现阶|现全价值|现金价直/g, "现金价值")
+    .replace(/内都收益率|内部收盗率|1RR|lRR/g, "IRR")
+    .replace(/减保保|诚保/g, "减保")
+    .replace(/退保保/g, "退保")
+    .replace(/重疾险险|重大疾炳|重大疾疾/g, "重大疾病")
+    .replace(/中疾保险金/g, "中度疾病保险金")
+    .replace(/轻疾保险金/g, "轻度疾病保险金")
+    .replace(/\u00a0/g, " ")
+    .replace(/===== PAGE \d+ =====/g, "\n")
+    .replace(/^.*(?:仅供内部使用|请勿外传|扫码关注|微信公众号|广告).*$/gm, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n[ \t]*\n+/g, "\n")
+    .replace(/([\u4e00-\u9fa5，、；：）)])\n(?=[\u4e00-\u9fa5（(0-9])/g, "$1")
+    .trim();
+  return corrected.slice(0, 180000);
 }
 
 function parseModelJson(content: string): ParsedPayload {
@@ -1626,6 +1982,7 @@ function calculatePaidYears(effectiveDate: string | null | undefined, paymentPer
 function enrichPoliciesWithComputedFields(policies: ParsedPolicy[], pdfText: string) {
   const reportDate = extractReportDate(pdfText);
   return policies.map((policy) => {
+    const productCategory = policy.product_category ?? inferSolutionProductCategory(`${policy.main_policy_name ?? ""} ${policy.core_benefits ?? ""}`);
     const paymentPeriodYears = extractYears(policy.payment_period);
     const annualPremium = toNumber(policy.annual_premium);
     const paidYears = toInteger(policy.paid_years) ?? calculatePaidYears(policy.effective_date, paymentPeriodYears, reportDate);
@@ -1637,12 +1994,119 @@ function enrichPoliciesWithComputedFields(policies: ParsedPolicy[], pdfText: str
 
     return {
       ...policy,
+      product_category: productCategory,
       paid_years: paidYears,
       remaining_years: remainingYears,
       remaining_premium: remainingPremium,
-      insurance_type: resolveInsuranceType(policy)
+      insurance_type: policy.insurance_type ?? mapProductCategoryToInsuranceType(productCategory) ?? resolveInsuranceType(policy),
+      benefit_details: policy.benefit_details?.length ? policy.benefit_details : buildSolutionBenefitDetails(policy)
     };
   });
+}
+
+function buildSolutionBenefitDetails(policy: ParsedPolicy): NonNullable<ParsedPolicy["benefit_details"]> {
+  const entries: Array<[string, string | null | undefined]> = [
+    ["核心保障责任", policy.core_benefits],
+    ["重大疾病保险金", policy.major_disease_benefit],
+    ["中度疾病保险金", policy.moderate_disease_benefit],
+    ["轻度疾病保险金", policy.mild_disease_benefit],
+    ["身故保险金", policy.death_benefit],
+    ["全残保险金", policy.total_disability_benefit],
+    ["疾病终末期", policy.terminal_illness_benefit],
+    ["其他保险责任", policy.other_benefits],
+    ["保费豁免", policy.premium_waiver],
+    ["免责条款", policy.exclusions],
+    ["现金价值/收益", policy.cash_value_returns],
+    ["产品约束规则", policy.product_constraints]
+  ];
+  return entries.flatMap(([name, rawDescription]) => {
+    const description = emptyToNull(rawDescription);
+    return description
+      ? [{ name, type: inferBenefitType(name), amount: null, description, waiting_period: null }]
+      : [];
+  });
+}
+
+function normalizeParsedPolicies(policies: ParsedPolicy[]) {
+  return policies.map((policy) => ({
+    ...policy,
+    policy_holder: normalizeNullableText(policy.policy_holder),
+    insured: normalizeNullableText(policy.insured),
+    insurer: normalizeNullableText(policy.insurer),
+    main_policy_name: normalizeNullableText(policy.main_policy_name),
+    product_info: normalizeNullableText(policy.product_info),
+    payment_period: normalizeNullableText(policy.payment_period),
+    effective_date: normalizeNullableText(policy.effective_date),
+    policy_service: normalizeNullableText(policy.policy_service),
+    payment_account: normalizeNullableText(policy.payment_account),
+    core_benefits: normalizeNullableText(policy.core_benefits),
+    major_disease_benefit: normalizeNullableText(policy.major_disease_benefit),
+    moderate_disease_benefit: normalizeNullableText(policy.moderate_disease_benefit),
+    mild_disease_benefit: normalizeNullableText(policy.mild_disease_benefit),
+    death_benefit: normalizeNullableText(policy.death_benefit),
+    total_disability_benefit: normalizeNullableText(policy.total_disability_benefit),
+    terminal_illness_benefit: normalizeNullableText(policy.terminal_illness_benefit),
+    other_benefits: normalizeNullableText(policy.other_benefits),
+    premium_waiver: normalizeNullableText(policy.premium_waiver),
+    exclusions: normalizeNullableText(policy.exclusions),
+    cash_value_returns: normalizeNullableText(policy.cash_value_returns),
+    product_constraints: normalizeNullableText(policy.product_constraints),
+    beneficiaries: Array.isArray(policy.beneficiaries)
+      ? policy.beneficiaries.map((beneficiary) => ({
+          ...beneficiary,
+          name: normalizeNullableText(beneficiary?.name),
+          relationship: normalizeNullableText(beneficiary?.relationship),
+          type: normalizeNullableText(beneficiary?.type)
+        }))
+      : [],
+    benefit_details: Array.isArray(policy.benefit_details)
+      ? policy.benefit_details.map((benefit) => ({
+          ...benefit,
+          name: normalizeNullableText(benefit?.name),
+          type: normalizeNullableText(benefit?.type),
+          description: normalizeNullableText(benefit?.description),
+          waiting_period: normalizeNullableText(benefit?.waiting_period)
+        }))
+      : []
+  }));
+}
+
+function normalizeNullableText(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (Array.isArray(value)) {
+    const text = value.map((item) => normalizeNullableText(item)).filter(Boolean).join("；");
+    return text || null;
+  }
+  if (typeof value === "object") {
+    const text = Object.values(value as Record<string, unknown>)
+      .map((item) => normalizeNullableText(item))
+      .filter(Boolean)
+      .join("；");
+    return text || null;
+  }
+  const text = sanitizeUnicodeText(String(value)).trim();
+  return text || null;
+}
+
+function sanitizeJsonForPostgres(value: unknown): Json {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return sanitizeUnicodeText(value);
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.map((item) => sanitizeJsonForPostgres(item));
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [sanitizeUnicodeText(key), sanitizeJsonForPostgres(item)])
+    );
+  }
+  return sanitizeUnicodeText(String(value));
+}
+
+function sanitizeUnicodeText(value: string) {
+  return value
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, "�")
+    .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "$1�");
 }
 
 function resolveInsuranceType(policy: ParsedPolicy): ParsedPolicy["insurance_type"] {
@@ -1980,6 +2444,15 @@ function isExcelFile(filename: string, mimeType: string | null) {
   );
 }
 
+function getSourceFileType(filename: string, mimeType: string | null): "pdf" | "excel" | "word" | "image" | "unknown" {
+  const lower = filename.toLowerCase();
+  if (isExcelFile(filename, mimeType)) return "excel";
+  if (isPdfFile(filename, mimeType)) return "pdf";
+  if (lower.endsWith(".docx") || lower.endsWith(".doc") || mimeType?.includes("word")) return "word";
+  if (/\.(jpe?g|png|webp)$/.test(lower) || mimeType?.startsWith("image/")) return "image";
+  return "unknown";
+}
+
 function parseMoney(value: unknown) {
   const textValue = emptyToNull(value);
   if (!textValue) return null;
@@ -2014,6 +2487,7 @@ function fieldLabel(field: keyof ParsedPolicy) {
     insured: "被保人",
     insurer: "保险公司",
     main_policy_name: "主险名称",
+    product_category: "产品分类",
     insurance_type: "保障类型",
     coverage_amount: "保险金额",
     annual_premium: "期缴保费",

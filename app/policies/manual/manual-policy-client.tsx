@@ -2,8 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { Plus, Save, Trash2 } from "lucide-react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Loader2, Plus, Save, Trash2 } from "lucide-react";
 import { createBrowserSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/database.types";
 
@@ -20,6 +20,7 @@ type PolicyForm = {
   coverageAmount: string;
   premiumAmount: string;
   premiumPeriod: string;
+  paidYears: string;
   effectiveDate: string;
   remainingYears: string;
   remainingPremium: string;
@@ -42,6 +43,7 @@ function createEmptyPolicy(index: number): PolicyForm {
     coverageAmount: "",
     premiumAmount: "",
     premiumPeriod: "",
+    paidYears: "",
     effectiveDate: "",
     remainingYears: "",
     remainingPremium: "",
@@ -53,12 +55,15 @@ function createEmptyPolicy(index: number): PolicyForm {
 
 export function ManualPolicyClient() {
   const searchParams = useSearchParams();
+  const router = useRouter();
   const customerId = searchParams.get("customerId") ?? "";
+  const source = searchParams.get("source") === "builder" ? "builder" : "inspection";
   const supabase = useMemo(() => createBrowserSupabaseClient(), []);
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [policies, setPolicies] = useState<PolicyForm[]>([createEmptyPolicy(1)]);
   const [message, setMessage] = useState("");
   const [isCustomerLoading, setIsCustomerLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
     async function loadCustomer() {
@@ -99,8 +104,102 @@ export function ManualPolicyClient() {
     setPolicies((current) => (current.length === 1 ? current : current.filter((policy) => policy.id !== id)));
   }
 
-  function handleSave() {
-    setMessage("手动录入内容已暂存在当前页面。下一步可接入保存入库并生成 H5 报告。");
+  async function handleSave() {
+    setMessage("");
+    if (!customerId || !customer) {
+      setMessage("请先选择需要绑定的客户。");
+      return;
+    }
+
+    const invalidPolicyIndex = policies.findIndex((policy) => !policy.insuredName.trim() || !policy.productName.trim());
+    if (invalidPolicyIndex >= 0) {
+      setMessage(`请补充保单 ${invalidPolicyIndex + 1} 的被保人和主险名称。`);
+      return;
+    }
+
+    setIsSaving(true);
+    const { data: userData, error: userError } = await supabase.auth.getUser();
+    if (userError || !userData.user) {
+      setMessage("登录状态已失效，请重新登录。");
+      setIsSaving(false);
+      return;
+    }
+
+    const reportId = createId();
+    const now = new Date().toISOString();
+    const standardPolicies = policies.map((policy) => ({
+      policy_holder: emptyToNull(policy.policyHolder),
+      insured: emptyToNull(policy.insuredName),
+      beneficiaries: policy.beneficiary.trim()
+        ? [{ name: policy.beneficiary.trim(), relationship: null, ratio: null, type: "未注明" }]
+        : [],
+      insurer: emptyToNull(policy.insurerName),
+      main_policy_name: emptyToNull(policy.productName),
+      product_info: emptyToNull(policy.productInfo),
+      insurance_type: policy.insuranceType,
+      coverage_amount: toNumber(policy.coverageAmount),
+      annual_premium: toNumber(policy.premiumAmount),
+      payment_period: policy.premiumPeriod ? `${toNumber(policy.premiumPeriod) ?? 0}年` : null,
+      effective_date: emptyToNull(policy.effectiveDate),
+      paid_years: toNumber(policy.paidYears),
+      remaining_years: toNumber(policy.remainingYears),
+      remaining_premium: toNumber(policy.remainingPremium),
+      policy_service: emptyToNull(policy.policyService),
+      benefit_details: [],
+      payment_account: emptyToNull(policy.paymentAccount)
+    }));
+    const annualPremiumTotal = standardPolicies.reduce((total, policy) => total + (policy.annual_premium ?? 0), 0);
+    const remainingPremiumTotal = standardPolicies.reduce((total, policy) => total + (policy.remaining_premium ?? 0), 0);
+    const verification = {
+      quality_status: "review_required",
+      total_policy_count: standardPolicies.length,
+      inserted_policy_count: standardPolicies.length,
+      annual_premium_total: Number(annualPremiumTotal.toFixed(2)),
+      remaining_premium_total: Number(remainingPremiumTotal.toFixed(2)),
+      has_duplicate_policies: false,
+      duplicate_policy_count: 0,
+      has_missing_fields: false,
+      missing_fields: []
+    };
+    const slug = `${Date.now().toString(36)}-${reportId.slice(0, 8)}`;
+    const { error } = await supabase.from("h5_reports").insert({
+      id: reportId,
+      user_id: userData.user.id,
+      customer_id: customerId,
+      slug,
+      title: source === "builder" ? `${customer.name}的产品方案评测` : `${customer.name}的家庭保障报告`,
+      status: "draft",
+      summary: {
+        module: source === "builder" ? "policy_builder" : "policy_inspection",
+        source_file_type: "manual",
+        stage: "manual_completed",
+        parse_status: "completed",
+        parsed_at: now,
+        review_status: "pending",
+        verification,
+        report_json: {
+          version: 1,
+          generated_at: now,
+          source: "manual_entry",
+          report_id: reportId,
+          customer_id: customerId,
+          file_id: null,
+          verification,
+          policies: standardPolicies
+        },
+        extracted_policies: standardPolicies
+      },
+      theme: {}
+    });
+
+    setIsSaving(false);
+    if (error) {
+      setMessage(error.message);
+      return;
+    }
+
+    setMessage("保存成功，正在生成报告页面...");
+    router.push(source === "builder" ? `/policy-builder/reports/${reportId}` : "/reports");
   }
 
   return (
@@ -120,10 +219,10 @@ export function ManualPolicyClient() {
           </div>
           <div className="flex flex-wrap gap-2">
             <Link
-              href="/upload"
+              href={source === "builder" ? "/policy-builder" : "/upload"}
               className="inline-flex items-center justify-center rounded-md border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-600"
             >
-              返回保单管理
+              {source === "builder" ? "返回保单智成" : "返回保单智检"}
             </Link>
             <button
               type="button"
@@ -155,7 +254,7 @@ export function ManualPolicyClient() {
               </button>
             </div>
 
-            <div className="mt-5 grid gap-4 lg:grid-cols-3">
+            <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               <Field label="投保人" value={policy.policyHolder} onChange={(value) => updatePolicy(policy.id, "policyHolder", value)} />
               <Field label="被保人" value={policy.insuredName} onChange={(value) => updatePolicy(policy.id, "insuredName", value)} />
               <Field label="受益人" value={policy.beneficiary} onChange={(value) => updatePolicy(policy.id, "beneficiary", value)} />
@@ -175,12 +274,13 @@ export function ManualPolicyClient() {
                   ))}
                 </select>
               </label>
-              <Field label="保险金额" value={policy.coverageAmount} onChange={(value) => updatePolicy(policy.id, "coverageAmount", value)} />
-              <Field label="期缴保费" value={policy.premiumAmount} onChange={(value) => updatePolicy(policy.id, "premiumAmount", value)} />
-              <Field label="缴费期间" value={policy.premiumPeriod} onChange={(value) => updatePolicy(policy.id, "premiumPeriod", value)} />
+              <Field label="保险金额" numeric value={policy.coverageAmount} onChange={(value) => updatePolicy(policy.id, "coverageAmount", value)} />
+              <Field label="期缴保费" numeric value={policy.premiumAmount} onChange={(value) => updatePolicy(policy.id, "premiumAmount", value)} />
+              <Field label="缴费期间（年）" numeric value={policy.premiumPeriod} onChange={(value) => updatePolicy(policy.id, "premiumPeriod", value)} />
+              <Field label="缴费年限（年）" numeric value={policy.paidYears} onChange={(value) => updatePolicy(policy.id, "paidYears", value)} />
               <Field label="生效日" type="date" value={policy.effectiveDate} onChange={(value) => updatePolicy(policy.id, "effectiveDate", value)} />
-              <Field label="待交年限" value={policy.remainingYears} onChange={(value) => updatePolicy(policy.id, "remainingYears", value)} />
-              <Field label="待缴保费" value={policy.remainingPremium} onChange={(value) => updatePolicy(policy.id, "remainingPremium", value)} />
+              <Field label="待交年限（年）" numeric value={policy.remainingYears} onChange={(value) => updatePolicy(policy.id, "remainingYears", value)} />
+              <Field label="待缴保费" numeric value={policy.remainingPremium} onChange={(value) => updatePolicy(policy.id, "remainingPremium", value)} />
               <Field label="保单服务" value={policy.policyService} onChange={(value) => updatePolicy(policy.id, "policyService", value)} />
               <Field label="缴费账户" value={policy.paymentAccount} onChange={(value) => updatePolicy(policy.id, "paymentAccount", value)} />
             </div>
@@ -202,10 +302,11 @@ export function ManualPolicyClient() {
         <button
           type="button"
           onClick={handleSave}
-          className="inline-flex items-center justify-center gap-2 rounded-md bg-brand px-5 py-3 text-sm font-semibold text-white shadow-lg"
+          disabled={isSaving || !customer}
+          className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-brand px-5 py-3 text-sm font-semibold text-white shadow-lg disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
         >
-          <Save className="h-4 w-4" />
-          保存录入内容
+          {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          {isSaving ? "正在保存..." : source === "builder" ? "保存并生成评测" : "保存报告"}
         </button>
       </div>
     </div>
@@ -216,22 +317,60 @@ function Field({
   label,
   value,
   onChange,
-  type = "text"
+  type = "text",
+  numeric = false
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   type?: string;
+  numeric?: boolean;
 }) {
   return (
     <label className="grid gap-2 text-sm font-semibold">
       {label}
       <input
-        type={type}
+        type={numeric ? "text" : type}
+        inputMode={numeric ? "decimal" : undefined}
         value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="rounded-md border border-slate-200 px-3 py-3 outline-none focus:border-brand"
+        onChange={(event) => onChange(numeric ? sanitizeNumber(event.target.value) : event.target.value)}
+        onBlur={() => numeric && value && onChange(formatNumber(value))}
+        className="w-full rounded-md border border-slate-200 px-3 py-3 outline-none focus:border-brand focus:ring-2 focus:ring-red-100"
       />
     </label>
   );
+}
+
+function sanitizeNumber(value: string) {
+  const cleaned = value.replace(/[^\d.]/g, "");
+  const [integer = "", ...decimals] = cleaned.split(".");
+  return decimals.length > 0 ? `${integer}.${decimals.join("").slice(0, 2)}` : integer;
+}
+
+function formatNumber(value: string) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(2) : "";
+}
+
+function toNumber(value: string) {
+  const number = Number(value);
+  return value.trim() && Number.isFinite(number) ? Number(number.toFixed(2)) : null;
+}
+
+function emptyToNull(value: string) {
+  return value.trim() || null;
+}
+
+function createId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
 }

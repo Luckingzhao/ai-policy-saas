@@ -2,7 +2,7 @@
 
 面向保险业务员的多租户 SaaS 基础架构。第一阶段已搭好 Next.js App Router、Supabase Auth、多租户数据库、RLS、Storage bucket 和基础页面路由。
 第二阶段已接入客户档案创建、客户绑定上传 PDF、`report_files` 文件记录和自动生成 `h5_reports` 草稿。
-第三阶段已接入 AI 保单解析：从已上传 PDF 抽取文本，调用 OpenAI 输出结构化 JSON，并写入保单、受益人和保障责任。
+第三阶段已接入 AI 保单解析：从已上传 PDF 抽取文本，通过统一 AI Gateway 输出结构化 JSON，并写入保单、受益人和保障责任。
 第四阶段已完成微信可打开的公开 H5 客户报告页，并在后台报告列表提供发布和复制分享链接能力。
 第五阶段已加入商业化 SaaS 能力：套餐额度、用量日志、超额限制、顾问品牌设置和 H5 品牌信息展示。
 
@@ -80,6 +80,7 @@ npm run dev
    - `DEEPSEEK_MODEL`，可选，默认 `deepseek-v4-flash`
    - `OPENROUTER_API_KEY`，使用 OpenRouter 时填写，填写后会优先使用 OpenRouter
    - `OPENROUTER_MODEL`，可选，默认 `openai/gpt-4o-mini`
+   - `OPENROUTER_VISION_MODEL`，可选，用于图片保单识别，默认 `google/gemini-2.5-flash`
    - `OPENAI_MODEL`，可选，默认 `gpt-4o-mini`
    - `NEXT_PUBLIC_APP_URL`
 4. Build Command 使用 `npm run build`。
@@ -167,12 +168,39 @@ insert into public.activation_codes (code, plan_code, monthly_report_limit, expi
 values ('ZY-2026-0001', 'zhiyou', 600, now() + interval '1 year');
 ```
 
+## AI Gateway 与 OpenClaw
+
+项目支持通过 OpenClaw 统一调度保单分析与报告分析，同时保留 OpenRouter、DeepSeek 和 OpenAI 作为自动回退渠道。
+
+本地 OpenClaw 默认地址为 `http://127.0.0.1:18789/v1`。先在 OpenClaw 配置中启用 Chat Completions HTTP 接口，再在 `.env.local` 填写：
+
+```env
+AI_PROVIDER=openclaw
+AI_FALLBACK_PROVIDER=openrouter
+OPENCLAW_BASE_URL=http://127.0.0.1:18789/v1
+OPENCLAW_GATEWAY_TOKEN=你的本地Gateway令牌
+OPENCLAW_ACCESS_TOKEN=远程反向代理访问令牌（本地直连时可留空）
+OPENCLAW_POLICY_AGENT=openclaw/policy-analysis
+OPENCLAW_CUSTOMER_AGENT=openclaw/customer-analysis
+OPENCLAW_REPORT_AGENT=openclaw/report-generation
+```
+
+三个 Agent 的边界如下：
+
+- `policy-analysis`：原始资料清洗、标准保单字段提取、计算与五项核验。
+- `customer-analysis`：基于已确认数据进行家庭保障结构与缺口分析。
+- `report-generation`：只基于最终 `report_json` 生成报告表达和多格式交付结构。
+
+`OPENCLAW_GATEWAY_TOKEN` 具有较高权限，只能保存在 `.env.local` 或部署平台的加密环境变量中，不得写入 Git。
+
+Vercel 无法访问个人电脑上的 `127.0.0.1`。正式环境改用 OpenClaw 前，必须先部署一个带 HTTPS 和访问控制的远程 Gateway，并将 `OPENCLAW_BASE_URL` 改为该远程地址；在此之前线上继续使用 OpenRouter。
+
 ## OpenRouter 配置
 
-项目兼容 OpenRouter、DeepSeek 和 OpenAI。优先级为：
+未显式配置 `AI_PROVIDER` 时，项目会自动选择可用渠道。配置 `AI_PROVIDER` 后，会优先使用指定渠道，并按 `AI_FALLBACK_PROVIDER` 自动回退。
 
 ```text
-OPENROUTER_API_KEY > DEEPSEEK_API_KEY > OPENAI_API_KEY
+OpenClaw > OpenRouter > DeepSeek > OpenAI
 ```
 
 使用 DeepSeek 时，在 `.env.local` 或 Vercel 环境变量里填写：

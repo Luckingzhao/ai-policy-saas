@@ -128,7 +128,7 @@ export function DashboardClient() {
               今天可以从客户资料、保单上传、报告核对三个环节推进服务，让客户更快看懂自己的家庭保障。
             </p>
             <div className="mt-6 flex flex-wrap gap-3">
-              <PrimaryAction href="/upload" label="上传保单" icon={UploadCloud} />
+              <PrimaryAction href="/upload" label="保单智检" icon={UploadCloud} />
               <SecondaryAction href="/reports" label="查看报告" />
             </div>
           </div>
@@ -160,7 +160,7 @@ export function DashboardClient() {
           </div>
           <div className="mt-5 grid gap-3">
             <WorkflowAction href="/customers" title="1. 创建客户档案" description="录入客户基础信息，作为保单和报告归属。" icon={Users} />
-            <WorkflowAction href="/upload" title="2. 上传保单资料" description="支持 PDF、Excel、Word 文件，上传后生成报告草稿。" icon={UploadCloud} />
+            <WorkflowAction href="/upload" title="2. 保单智检" description="支持 PDF、Excel、Word 文件，上传后生成报告草稿。" icon={UploadCloud} />
             <WorkflowAction href="/reports" title="3. 核对并发布报告" description="完成 AI 解析核对后，导出 H5 分享给客户。" icon={FileCheck2} />
           </div>
         </div>

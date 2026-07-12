@@ -1,0 +1,10 @@
+openclaw.43.133.232.114.nip.io {
+	@unauthorized not header X-OpenClaw-Access __OPENCLAW_ACCESS_TOKEN__
+
+	handle /v1/* {
+		respond @unauthorized 404
+		reverse_proxy 127.0.0.1:31707
+	}
+
+	respond 404
+}

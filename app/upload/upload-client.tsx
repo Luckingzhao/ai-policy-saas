@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   CheckSquare,
   ClipboardPenLine,
@@ -9,6 +10,7 @@ import {
   FileText,
   FileType2,
   FileUp,
+  Image as ImageIcon,
   Loader2,
   Square,
   Trash2,
@@ -27,7 +29,7 @@ type Subscription = Pick<
   Database["public"]["Tables"]["subscriptions"]["Row"],
   "id" | "plan_code" | "monthly_report_limit" | "monthly_upload_limit"
 >;
-type UploadFormat = "pdf" | "excel" | "word";
+type UploadFormat = "pdf" | "excel" | "word" | "image";
 
 const uploadFormats: Record<
   UploadFormat,
@@ -63,12 +65,21 @@ const uploadFormats: Record<
     mimeTypes: ["application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
     defaultMimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     uploadLabel: "Word 文件"
+  },
+  image: {
+    label: "图片格式",
+    accept: "image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp",
+    extensions: [".jpg", ".jpeg", ".png", ".webp"],
+    mimeTypes: ["image/jpeg", "image/png", "image/webp"],
+    defaultMimeType: "image/jpeg",
+    uploadLabel: "保单图片"
   }
 };
 
 const MAX_PDF_FILE_SIZE = 20 * 1024 * 1024;
 
-export function UploadClient() {
+export function UploadClient({ mode = "inspection" }: { mode?: "inspection" | "builder" }) {
+  const router = useRouter();
   const supabase = useMemo(() => createBrowserSupabaseClient(), []);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [files, setFiles] = useState<UploadedFile[]>([]);
@@ -258,17 +269,18 @@ export function UploadClient() {
           user_id: userData.user.id,
           customer_id: customerId,
           slug,
-          title: `${customerName}的家庭保障报告`,
+          title: mode === "builder" ? `${customerName}的产品方案评测` : `${customerName}的家庭保障报告`,
           status: "draft",
           summary: {
             report_file_id: fileResult.data.id,
             original_filename: selectedFile.name,
             source_file_type: uploadFormat,
             source_mime_type: contentType,
+            module: mode === "builder" ? "policy_builder" : "policy_inspection",
             stage: "uploaded"
           },
           theme: {}
-        }),
+        }).select("id").single(),
         20000,
         "报告草稿创建超时，请稍后刷新报告列表确认。"
       );
@@ -290,6 +302,24 @@ export function UploadClient() {
           source_file_type: uploadFormat
         }
       });
+
+      if (mode === "builder") {
+        setUploadStep("正在解析方案资料...");
+        const { data: sessionData } = await supabase.auth.getSession();
+        const accessToken = sessionData.session?.access_token;
+        if (!accessToken) throw new Error("登录状态已失效，请重新登录。");
+
+        const parseResponse = await fetch(`/api/reports/${reportResult.data.id}/parse`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        const parseResult = (await parseResponse.json()) as { policy_count?: number; error?: string };
+        if (!parseResponse.ok) throw new Error(parseResult.error || "方案资料解析失败。");
+        if (!parseResult.policy_count) throw new Error("解析完成但未识别到产品，请检查文件内容或更换格式后重试。");
+
+        router.push(`/policy-builder/reports/${reportResult.data.id}`);
+        return;
+      }
 
       setUploadStep("正在刷新上传记录...");
       setSelectedFile(null);
@@ -366,7 +396,7 @@ export function UploadClient() {
             <FileUp className="h-6 w-6" />
           </span>
           <div>
-            <h2 className="text-lg font-semibold">上传文件</h2>
+            <h2 className="text-lg font-semibold">{mode === "builder" ? "方案上传" : "上传文件"}</h2>
             <p className="mt-1 text-sm text-slate-500">
               {usageLimitDisabled
                 ? "本地测试模式：已跳过报告额度限制"
@@ -397,11 +427,11 @@ export function UploadClient() {
                 </button>
               ))}
               <Link
-                href={customerId ? `/policies/manual?customerId=${customerId}` : "/policies/manual"}
+                href={customerId ? `/policies/manual?customerId=${customerId}&source=${mode}` : `/policies/manual?source=${mode}`}
                 className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-3 text-sm font-semibold text-slate-600"
               >
                 <ClipboardPenLine className="h-4 w-4" />
-                手动录入
+                手动表单录入
               </Link>
             </div>
           </label>
@@ -427,7 +457,9 @@ export function UploadClient() {
           <label className="grid cursor-pointer gap-3 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-5 py-8 text-center">
             <UploadCloud className="mx-auto h-8 w-8 text-brand" />
             <span className="font-semibold">{selectedFile ? selectedFile.name : `选择${uploadFormats[uploadFormat].uploadLabel}`}</span>
-            <span className="text-sm text-slate-500">上传后会记录文件并创建报告草稿</span>
+            <span className="text-sm text-slate-500">
+              {mode === "builder" ? "上传后自动解析并生成产品评测方案" : "上传后会记录文件并创建报告草稿"}
+            </span>
             <input
               key={uploadFormat}
               type="file"
@@ -462,7 +494,7 @@ export function UploadClient() {
             className="inline-flex items-center justify-center gap-2 rounded-md bg-brand px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
-            {isUploading ? "处理中..." : "上传并生成草稿"}
+            {isUploading ? "处理中..." : mode === "builder" ? "上传产品资料并生成评测报告" : "上传并生成草稿"}
           </button>
         </form>
       </section>
@@ -576,6 +608,7 @@ function isExcelFile(file: UploadedFile) {
 function getFormatIcon(format: UploadFormat) {
   if (format === "excel") return <FileSpreadsheet className="h-4 w-4" />;
   if (format === "word") return <FileType2 className="h-4 w-4" />;
+  if (format === "image") return <ImageIcon className="h-4 w-4" />;
   return <FileText className="h-4 w-4" />;
 }
 
