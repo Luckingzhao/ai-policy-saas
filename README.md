@@ -193,6 +193,35 @@ OPENCLAW_REPORT_AGENT=openclaw/report-generation
 
 `OPENCLAW_GATEWAY_TOKEN` 具有较高权限，只能保存在 `.env.local` 或部署平台的加密环境变量中，不得写入 Git。
 
+### 按任务类型选择模型
+
+新的服务端 AI 入口位于 `lib/ai/index.ts`。业务 API 只能通过 `runAiTask` 调用模型，不应直接创建 OpenAI 客户端或写入模型 ID。
+
+推荐先在 Vercel 使用 OpenRouter：
+
+```env
+AI_PROVIDER=openrouter
+AI_TEXT_MODEL_FAST=deepseek/deepseek-v4-flash
+AI_TEXT_MODEL_PRO=deepseek/deepseek-v4-pro
+AI_VISION_MODEL_PRIMARY=google/gemini-3.1-pro-preview
+AI_VISION_MODEL_FALLBACK=qwen/qwen3-vl-235b-a22b-instruct
+AI_EXPERT_REVIEW_MODEL=openai/gpt-5.6-terra
+OPENROUTER_API_KEY=你的服务端密钥
+```
+
+接通远程 OpenClaw HTTPS Gateway 后，可切换为：
+
+```env
+AI_PROVIDER=openclaw
+OPENCLAW_BASE_URL=https://你的-gateway.example.com/v1
+OPENCLAW_GATEWAY_TOKEN=你的-gateway-token
+OPENCLAW_ACCESS_TOKEN=你的反向代理访问令牌
+```
+
+客户摘要、标签、标题、后台分类和保单文本提取使用 DeepSeek V4 Flash；Flash 仅在允许的供应商故障时回退到 DeepSeek V4 Pro。保单核验、产品分析、家庭保障缺口和最终报告使用 DeepSeek V4 Pro，失败后不会自动调用昂贵的专家模型。图片先由 Gemini 3.1 Pro Preview 提取，允许回退到 Qwen3 VL，再由文字 Pro 模型核验。模型返回的 JSON 必须通过 Zod 校验，校验失败不会盲目切换模型，而是进入人工复核。
+
+`openai/gpt-5.6-terra` 仅预留给未来的人工“专家复核”按钮。当前 `runAiTask` 会拒绝自动执行 `expert_review`，不得把 Terra 放入任何自动降级链。
+
 Vercel 无法访问个人电脑上的 `127.0.0.1`。正式环境改用 OpenClaw 前，必须先部署一个带 HTTPS 和访问控制的远程 Gateway，并将 `OPENCLAW_BASE_URL` 改为该远程地址；在此之前线上继续使用 OpenRouter。
 
 ## OpenRouter 配置

@@ -2,7 +2,9 @@ import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 import type { Database, Json } from "@/lib/supabase/database.types";
+import { runAiTask } from "@/lib/ai";
 import { getAiRuntimes, isRetryableGatewayError, type AiRuntime } from "@/lib/ai/gateway";
+import { policyExtractionSchema } from "@/lib/ai/schemas/policy-analysis";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -201,6 +203,7 @@ export async function POST(request: Request, context: RouteContext) {
       }
     } else {
       const aiOptions = getAiRuntimes("policy")[0] ?? null;
+      const useUnifiedAiRouter = process.env.AI_UNIFIED_POLICY_PARSING === "true";
 
       if (sourceFileType === "image") {
         const visionRuntime = getAiRuntimes("vision")[0] ?? null;
@@ -228,9 +231,16 @@ export async function POST(request: Request, context: RouteContext) {
 
         const cleanedText = isPolicyBuilder ? cleanInsuranceSolutionText(documentText) : documentText;
         const localPolicies = extractPoliciesWithLocalRules(cleanedText);
-        const parsed = isPolicyBuilder && aiOptions
-          ? await extractSolutionPoliciesWithOpenAI(cleanedText, aiOptions)
-          : await extractPoliciesWithBestAvailableMethod(cleanedText, localPolicies, aiOptions);
+        const parsed = isPolicyBuilder && useUnifiedAiRouter
+          ? await extractPoliciesWithUnifiedRouter(cleanedText, true, userId, userId)
+          : isPolicyBuilder && aiOptions
+            ? await extractSolutionPoliciesWithOpenAI(cleanedText, aiOptions)
+            : await extractPoliciesWithBestAvailableMethod(
+                cleanedText,
+                localPolicies,
+                aiOptions,
+                useUnifiedAiRouter ? { tenantId: userId, userId } : null
+              );
         policies = enrichPoliciesWithComputedFields(normalizeParsedPolicies(parsed.policies ?? []), cleanedText);
         sourceText = cleanedText;
       }
@@ -1077,7 +1087,8 @@ async function extractPoliciesWithOpenAI(
 async function extractPoliciesWithBestAvailableMethod(
   pdfText: string,
   localPolicies: ParsedPolicy[],
-  aiOptions: AiRuntime | null
+  aiOptions: AiRuntime | null,
+  unifiedContext: { tenantId: string; userId: string } | null = null
 ): Promise<ParsedPayload> {
   const expectedCount = extractExpectedPolicyCount(pdfText);
   if (isAiaFamilyReport(pdfText) && hasCoreLocalFields(localPolicies) && (!expectedCount || expectedCount === localPolicies.length)) {
@@ -1088,13 +1099,20 @@ async function extractPoliciesWithBestAvailableMethod(
     return { policies: localPolicies };
   }
 
-  if (!aiOptions) {
+  if (!aiOptions && !unifiedContext) {
     if (localPolicies.length > 0) return { policies: localPolicies };
     throw new Error("请配置 DEEPSEEK_API_KEY、OPENROUTER_API_KEY 或 OPENAI_API_KEY，或上传文本型保单 PDF。");
   }
 
   try {
-    const aiParsed = await extractPoliciesWithOpenAI(pdfText, aiOptions);
+    const aiParsed = unifiedContext
+      ? await extractPoliciesWithUnifiedRouter(
+          pdfText,
+          false,
+          unifiedContext.tenantId,
+          unifiedContext.userId
+        )
+      : await extractPoliciesWithOpenAI(pdfText, aiOptions as AiRuntime);
     const aiPolicies = aiParsed.policies ?? [];
     const expectedCount = extractExpectedPolicyCount(pdfText);
     if (aiPolicies.length > 0 && aiPolicies.length >= localPolicies.length && (!expectedCount || aiPolicies.length >= expectedCount)) return aiParsed;
@@ -1103,6 +1121,26 @@ async function extractPoliciesWithBestAvailableMethod(
   }
 
   return { policies: localPolicies };
+}
+
+async function extractPoliciesWithUnifiedRouter(
+  sourceText: string,
+  isSolution: boolean,
+  tenantId: string,
+  userId: string
+): Promise<ParsedPayload> {
+  const relevantText = isSolution ? sourceText.slice(0, 30000) : extractRelevantPolicyText(sourceText).slice(0, 20000);
+  const result = await runAiTask({
+    task: "policy_text_extraction",
+    tenantId,
+    userId,
+    responseSchema: policyExtractionSchema,
+    messages: isSolution
+      ? buildSolutionExtractionMessages(relevantText)
+      : buildPolicyExtractionMessages(relevantText)
+  });
+
+  return { policies: result.data.policies };
 }
 
 function hasReliableLocalExtraction(policies: ParsedPolicy[], pdfText: string) {

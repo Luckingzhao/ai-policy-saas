@@ -27,3 +27,5 @@ pnpm-debug.log*
 # local scratch files
 work
 outputs/*_h5/
+tsconfig.tsbuildinfo
+graphify-out/

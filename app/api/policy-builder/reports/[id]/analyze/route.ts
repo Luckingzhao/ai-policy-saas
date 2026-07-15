@@ -1,29 +1,14 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import type { Database, Json } from "@/lib/supabase/database.types";
-import { getAiRuntimes, isRetryableGatewayError, type AiRuntime } from "@/lib/ai/gateway";
+import { runAiTask } from "@/lib/ai";
+import { AiOutputValidationError, AiRetryableError } from "@/lib/ai/errors";
+import { productAnalysisSchema } from "@/lib/ai/schemas/policy-analysis";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
 type RouteContext = { params: Promise<{ id: string }> };
-
-type TalkingAnalysis = {
-  advantages: Array<{ product_name: string | null; title: string; evidence: string; talking_point: string }>;
-  weaknesses: Array<{
-    product_name: string | null;
-    title: string;
-    evidence: string;
-    risk_level: "高" | "中" | "提示";
-    talking_point: string;
-  }>;
-  fit_and_comparison: {
-    fit_customers: Array<{ profile: string; reason: string }>;
-    unsuitable_customers: Array<{ profile: string; reason: string }>;
-    comparison_advice: Array<{ scenario: string; recommendation: string; evidence: string }>;
-    broker_script: string[];
-  };
-};
 
 export async function POST(request: Request, context: RouteContext) {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -55,49 +40,59 @@ export async function POST(request: Request, context: RouteContext) {
   if (!reportJson || policies.length === 0) return NextResponse.json({ error: "请先完成方案资料解析。" }, { status: 400 });
 
   try {
-    const analysis = await generateTalkingAnalysis(policies, typeof reportJson.source_text === "string" ? reportJson.source_text : "");
+    const result = await generateTalkingAnalysis(
+      policies,
+      typeof reportJson.source_text === "string" ? reportJson.source_text : "",
+      userData.user.id,
+      userData.user.id
+    );
     const nextReportJson = {
       ...reportJson,
-      analysis_status: "completed",
+      analysis_status: result.reviewStatus,
+      review_status: result.reviewStatus,
       analyzed_at: new Date().toISOString(),
-      talking_analysis: analysis as unknown as Json
+      talking_analysis: result.data as unknown as Json
     };
     const nextSummary = { ...summary, report_json: nextReportJson };
     const { error } = await supabase.from("h5_reports").update({ summary: nextSummary as Json }).eq("id", id).eq("user_id", userData.user.id);
     if (error) throw new Error(error.message);
-    return NextResponse.json({ ok: true, analysis });
+    return NextResponse.json({ ok: true, analysis: result.data, review_status: result.reviewStatus });
   } catch (error) {
     const message = error instanceof Error ? error.message : "谈单分析生成失败。";
+    const needsHumanReview = error instanceof AiOutputValidationError;
+    const canRetry = error instanceof AiRetryableError;
     await supabase
       .from("h5_reports")
-      .update({ summary: { ...summary, report_json: { ...reportJson, analysis_status: "failed", analysis_error: message } } as Json })
+      .update({
+        summary: {
+          ...summary,
+          report_json: {
+            ...reportJson,
+            analysis_status: needsHumanReview ? "pending_human_review" : canRetry ? "retryable" : "failed",
+            review_status: needsHumanReview || canRetry ? "pending_human_review" : reportJson.review_status,
+            analysis_error: message
+          }
+        } as Json
+      })
       .eq("id", id)
       .eq("user_id", userData.user.id);
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json(
+      {
+        error: message,
+        retryable: canRetry,
+        review_status: needsHumanReview || canRetry ? "pending_human_review" : undefined
+      },
+      { status: needsHumanReview ? 422 : canRetry ? 503 : 500 }
+    );
   }
 }
 
-async function generateTalkingAnalysis(policies: Json[], sourceText: string): Promise<TalkingAnalysis> {
-  const runtimes = getAiRuntimes("report");
-  if (runtimes.length === 0) throw new Error("请配置 OpenClaw Gateway、OpenRouter、DeepSeek 或 OpenAI。");
-  let lastError: unknown;
-  for (const runtime of runtimes) {
-    try {
-      return await callAnalysisModel(runtime, policies, sourceText);
-    } catch (error) {
-      lastError = error;
-      if (!isRetryableGatewayError(error)) throw error;
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error("AI 服务暂时不可用，请稍后重试。");
-}
-
-async function callAnalysisModel(runtime: AiRuntime, policies: Json[], sourceText: string) {
-  const completion = await runtime.client.chat.completions.create({
-    model: runtime.model,
-    temperature: 0.15,
-    max_tokens: 4200,
-    response_format: { type: "json_object" },
+async function generateTalkingAnalysis(policies: Json[], sourceText: string, tenantId: string, userId: string) {
+  return runAiTask({
+    task: "product_analysis",
+    tenantId,
+    userId,
+    responseSchema: productAnalysisSchema,
     messages: [
       {
         role: "system",
@@ -125,31 +120,6 @@ ${sourceText.slice(0, 28000)}`
       }
     ]
   });
-  const content = completion.choices[0]?.message?.content;
-  if (!content) throw new Error("模型未返回谈单分析结果。");
-  const parsed = parseAnalysisJson(content);
-  validateAnalysis(parsed);
-  return parsed;
-}
-
-function parseAnalysisJson(content: string): TalkingAnalysis {
-  try {
-    return JSON.parse(content) as TalkingAnalysis;
-  } catch {
-    const match = content.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error("模型返回的谈单分析不是有效 JSON。");
-    return JSON.parse(match[0]) as TalkingAnalysis;
-  }
-}
-
-function validateAnalysis(value: TalkingAnalysis) {
-  if (!value || !Array.isArray(value.advantages) || !Array.isArray(value.weaknesses) || !value.fit_and_comparison) {
-    throw new Error("模型返回的谈单分析结构不完整。");
-  }
-  value.fit_and_comparison.fit_customers ??= [];
-  value.fit_and_comparison.unsuitable_customers ??= [];
-  value.fit_and_comparison.comparison_advice ??= [];
-  value.fit_and_comparison.broker_script ??= [];
 }
 
 function isObject(value: unknown): value is Record<string, Json> {

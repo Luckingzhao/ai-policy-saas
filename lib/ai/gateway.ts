@@ -1,3 +1,4 @@
+import "server-only";
 import OpenAI from "openai";
 
 export type AiProvider = "openclaw" | "openrouter" | "deepseek" | "openai";
