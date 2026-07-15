@@ -216,7 +216,12 @@ AI_PROVIDER=openclaw
 OPENCLAW_BASE_URL=https://你的-gateway.example.com/v1
 OPENCLAW_GATEWAY_TOKEN=你的-gateway-token
 OPENCLAW_ACCESS_TOKEN=你的反向代理访问令牌
+OPENCLAW_POLICY_AGENT=openclaw/policy-analysis
+OPENCLAW_CUSTOMER_AGENT=openclaw/customer-analysis
+OPENCLAW_REPORT_AGENT=openclaw/report-generation
 ```
+
+统一任务路由在 OpenClaw 模式下传递的是 `openclaw/<agentId>`，而不是 OpenRouter 的模型 ID。保单提取、保单核验和产品分析进入 `policy-analysis`；客户摘要、标签和家庭保障缺口进入 `customer-analysis`；标题和最终报告生成进入 `report-generation`。每个 Agent 的主备模型由 OpenClaw 自身配置。
 
 客户摘要、标签、标题、后台分类和保单文本提取使用 DeepSeek V4 Flash；Flash 仅在允许的供应商故障时回退到 DeepSeek V4 Pro。保单核验、产品分析、家庭保障缺口和最终报告使用 DeepSeek V4 Pro，失败后不会自动调用昂贵的专家模型。图片先由 Gemini 3.1 Pro Preview 提取，允许回退到 Qwen3 VL，再由文字 Pro 模型核验。模型返回的 JSON 必须通过 Zod 校验，校验失败不会盲目切换模型，而是进入人工复核。
 

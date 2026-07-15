@@ -1,7 +1,7 @@
 import "server-only";
 import { z } from "zod";
 import { AiConfigurationError, AiOutputValidationError, AiRetryableError, classifyAiFailure } from "@/lib/ai/errors";
-import { callOpenClaw } from "@/lib/ai/providers/openclaw";
+import { callOpenClaw, getOpenClawAgent } from "@/lib/ai/providers/openclaw";
 import { callOpenRouter } from "@/lib/ai/providers/openrouter";
 import { safeAiErrorMessage } from "@/lib/ai/redaction";
 import { getTaskRoute } from "@/lib/ai/task-router";
@@ -22,10 +22,11 @@ export async function runAiTask<TSchema extends z.ZodTypeAny>(
   }
 
   const provider = resolveProvider();
+  const models = provider === "openclaw" ? [getOpenClawAgent(input.task)] : route.models;
   let lastError: unknown;
 
-  for (let index = 0; index < route.models.length; index += 1) {
-    const model = route.models[index];
+  for (let index = 0; index < models.length; index += 1) {
+    const model = models[index];
     try {
       const content = await callProvider(provider, {
         model,
@@ -44,7 +45,7 @@ export async function runAiTask<TSchema extends z.ZodTypeAny>(
       return { data: parsed.data, provider, model, reviewStatus: "pending_human_review" };
     } catch (error) {
       lastError = error;
-      const mayFallback = classifyAiFailure(error) === "fallback_allowed" && index < route.models.length - 1;
+      const mayFallback = classifyAiFailure(error) === "fallback_allowed" && index < models.length - 1;
       if (!mayFallback) throw normalizePublicError(error);
     }
   }

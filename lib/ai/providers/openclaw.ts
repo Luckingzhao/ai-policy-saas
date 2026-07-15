@@ -1,7 +1,7 @@
 import "server-only";
 import OpenAI from "openai";
 import { AiConfigurationError } from "@/lib/ai/errors";
-import type { ProviderRequest } from "@/lib/ai/types";
+import type { AiTaskType, ProviderRequest } from "@/lib/ai/types";
 
 export async function callOpenClaw(request: ProviderRequest) {
   const apiKey = process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -17,7 +17,7 @@ export async function callOpenClaw(request: ProviderRequest) {
   });
 
   const completion = await client.chat.completions.create({
-    model: toOpenClawModel(request.model),
+    model: request.model,
     temperature: 0.1,
     max_tokens: 5000,
     response_format: { type: "json_object" },
@@ -27,8 +27,27 @@ export async function callOpenClaw(request: ProviderRequest) {
   return completion.choices[0]?.message?.content ?? "";
 }
 
-function toOpenClawModel(openRouterModel: string) {
-  return openRouterModel.startsWith("openrouter/") ? openRouterModel : `openrouter/${openRouterModel}`;
+export function getOpenClawAgent(task: AiTaskType) {
+  const configuredAgent = getConfiguredAgent(task);
+  const normalized = configuredAgent.trim().replace(/^\/+|\/+$/g, "");
+  if (!normalized) throw new AiConfigurationError(`任务 ${task} 未配置 OpenClaw Agent。`);
+  if (normalized === "openclaw" || normalized.startsWith("openclaw/")) return normalized;
+  return `openclaw/${normalized}`;
+}
+
+function getConfiguredAgent(task: AiTaskType) {
+  if (task === "final_report_generation" || task === "title_generation") {
+    return process.env.OPENCLAW_REPORT_AGENT || "openclaw/report-generation";
+  }
+  if (
+    task === "family_gap_analysis" ||
+    task === "customer_summary" ||
+    task === "customer_tagging" ||
+    task === "background_classification"
+  ) {
+    return process.env.OPENCLAW_CUSTOMER_AGENT || "openclaw/customer-analysis";
+  }
+  return process.env.OPENCLAW_POLICY_AGENT || "openclaw/policy-analysis";
 }
 
 function attachImages(messages: ProviderRequest["messages"], images: ProviderRequest["images"]) {
